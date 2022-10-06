@@ -1,0 +1,4 @@
+URL: https://github.com/Microsoft/DirectXShaderCompiler
+Version: DX Compiler release for July 2022
+Commit: e9137cd1dc064dae2e7129203cb1c64153309c91
+Downloaded: 2022-08-05

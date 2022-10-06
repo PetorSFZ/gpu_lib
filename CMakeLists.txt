@@ -52,6 +52,19 @@ set(CMAKE_C_FLAGS_DEBUG ${CMAKE_CXX_FLAGS_DEBUG})
 set(CMAKE_C_FLAGS_RELWITHDEBINFO ${CMAKE_CXX_FLAGS_RELWITHDEBINFO})
 set(CMAKE_C_FLAGS_RELEASE ${CMAKE_CXX_FLAGS_RELEASE})
 
+# Bundled externals
+# ------------------------------------------------------------------------------------------------
+
+set(EXTERNALS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/externals)
+
+# D3D12 Agility SDK
+# ${D3D12_AGILITY_SDK_FOUND}, ${D3D12_AGILITY_SDK_INCLUDE_DIRS}, ${D3D12_AGILITY_SDK_RUNTIME_FILES}
+add_subdirectory(${EXTERNALS_DIR}/D3D12AgilitySDK)
+
+# dxc
+# ${DXC_FOUND}, ${DXC_INCLUDE_DIRS}, ${DXC_LIBRARIES}, ${DXC_RUNTIME_FILES}
+add_subdirectory(${EXTERNALS_DIR}/dxc)
+
 # gpu_lib library
 # ------------------------------------------------------------------------------------------------
 
@@ -63,8 +76,14 @@ source_group(TREE ${SRC_DIR} FILES ${SRC_FILES})
 
 add_library(gpu_lib ${SRC_FILES})
 
-target_include_directories(gpu_lib PUBLIC
+target_include_directories(gpu_lib PRIVATE
 	${SRC_DIR}
+	${D3D12_AGILITY_SDK_INCLUDE_DIRS}
+	${DXC_INCLUDE_DIRS}
+)
+
+target_link_libraries(gpu_lib
+	${DXC_LIBRARIES}
 )
 
 # Samples
@@ -78,3 +97,45 @@ target_include_directories(gpu_lib_sample_1 PUBLIC
 	${SAMPLES_DIR}
 )
 target_link_libraries(gpu_lib_sample_1 gpu_lib)
+
+# File copying
+# ------------------------------------------------------------------------------------------------
+
+# Windows only, copies files to the output binary dir (${CMAKE_BINARY_DIR}).
+#
+# This function takes a variable number of parameters (i.e. vararg), each parameter is a path to
+# something to be copied in to your binary directory.
+function(copyRuntimeFilesToBinaryDir)
+	if(MSVC)
+		message("-- Copying following files to binary dir:")
+		foreach(runtimeFilePath ${ARGV})
+			message("  -- ${runtimeFilePath}")
+		endforeach()
+
+		foreach(runtimeFilePath ${ARGV})
+			# Do different things depending on if we are generating .sln or using built-in VS CMake
+			if(CMAKE_CONFIGURATION_TYPES)
+				file(COPY ${runtimeFilePath} DESTINATION ${CMAKE_BINARY_DIR}/Debug)
+				file(COPY ${runtimeFilePath} DESTINATION ${CMAKE_BINARY_DIR}/RelWithDebInfo)
+				file(COPY ${runtimeFilePath} DESTINATION ${CMAKE_BINARY_DIR}/Release)
+			else()
+				file(COPY ${runtimeFilePath} DESTINATION ${CMAKE_BINARY_DIR})
+			endif()
+		endforeach()
+	endif()
+endfunction()
+
+copyRuntimeFilesToBinaryDir(${DXC_RUNTIME_FILES})
+
+# Copy D3D12 Agility SDK to binary dir
+if(MSVC)
+	foreach(dllPath ${D3D12_AGILITY_SDK_RUNTIME_FILES})
+		if(CMAKE_CONFIGURATION_TYPES)
+			file(COPY ${dllPath} DESTINATION ${CMAKE_BINARY_DIR}/Debug/D3D12)
+			file(COPY ${dllPath} DESTINATION ${CMAKE_BINARY_DIR}/RelWithDebInfo/D3D12)
+			file(COPY ${dllPath} DESTINATION ${CMAKE_BINARY_DIR}/Release/D3D12)
+		else()
+			file(COPY ${dllPath} DESTINATION ${CMAKE_BINARY_DIR}/D3D12)
+		endif()
+	endforeach()
+endif()

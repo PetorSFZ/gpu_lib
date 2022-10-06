@@ -2,6 +2,38 @@
 
 #include <sfz_cpp.hpp>
 
+// Windows.h
+#pragma warning(push, 0)
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+#include <wrl.h> // ComPtr
+//#include <Winerror.h>
+#pragma warning(pop)
+
+// D3D12 headers
+#include <D3D12AgilitySDK/d3d12.h>
+#pragma comment (lib, "d3d12.lib")
+#include <dxgi1_6.h>
+#pragma comment (lib, "dxgi.lib")
+//#pragma comment (lib, "dxguid.lib")
+#include <D3D12AgilitySDK/d3d12shader.h>
+
+// DXC compiler
+#include <dxc/dxcapi.h>
+
+// D3D12 Agility SDK exports
+// ------------------------------------------------------------------------------------------------
+
+// Note: It seems this is not enough and must also be in the exe file of the application using
+//       ZeroG. A bit annoying, but don't have a good solution to it for now.
+
+// The version of the Agility SDK we are using, see https://devblogs.microsoft.com/directx/directx12agility/
+extern "C" { _declspec(dllexport) extern const u32 D3D12SDKVersion = 606; }
+
+// Specifies that D3D12Core.dll will be available in a directory called D3D12 next to the exe.
+extern "C" { _declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\"; }
+
 // gpu_lib
 // ------------------------------------------------------------------------------------------------
 
