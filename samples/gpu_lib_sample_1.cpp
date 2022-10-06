@@ -22,7 +22,9 @@ i32 main(i32 argc, char* argv[])
 	// Initialize gpu_lib
 	const GpuLibInitCfg gpu_init_cfg = GpuLibInitCfg{
 		.cpu_allocator = &global_cpu_allocator,
-		.gpu_heap_size_bytes = U32_MAX
+		.gpu_heap_size_bytes = U32_MAX,
+		.debug_mode = true,
+		.debug_mode_gpu_validation = false
 	};
 	GpuLib* gpu = gpuLibInit(&gpu_init_cfg);
 	if (gpu == nullptr) {

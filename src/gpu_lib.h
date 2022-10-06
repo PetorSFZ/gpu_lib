@@ -12,6 +12,8 @@ struct GpuLib;
 sfz_struct(GpuLibInitCfg) {
 	SfzAllocator* cpu_allocator;
 	u32 gpu_heap_size_bytes;
+	bool debug_mode;
+	bool debug_mode_gpu_validation;
 };
 
 sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfg);
