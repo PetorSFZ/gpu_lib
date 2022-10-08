@@ -37,6 +37,29 @@ sfz_constant GpuPtr GPU_NULLPTR = {};
 sfz_extern_c GpuPtr gpuMalloc(GpuLib* gpu, u32 num_bytes);
 sfz_extern_c void gpuFree(GpuLib* gpu, GpuPtr ptr);
 
+// Textures API
+// ------------------------------------------------------------------------------------------------
+
+// Unfortunately we probably do need textures. But maybe we can limit to:
+// * 2D only
+// * Two separate types, read-only and read-write
+// * Can not convert between read-only and read-write
+//     * I.e., read-only can only have data supplied from CPU. Can never be written to on GPU.
+//     * Read-write can NEVER have data supplied from CPU, must be written to on GPU.
+//     * Use cases: read-only for "normal assets" that needs to be rendered, read-write for
+//       framebuffers, shadow maps, other similar maps generated on the GPU.
+//     * As a consequence, generating mipmaps on GPU becomes impossible, but who cares really.
+// * Read-write has no mipmaps
+// * 2 global texture arrays (bindless textures), one for read-only and one for read-write
+// * All textures allocated using comitted (dedicated) allocations
+// * Texture creation and uploading "stops the world" and is very slow, no texture streaming.
+// * Limited amount of samplers that are always available in the global root signature
+// * Only power of two for read-only textures (because mipmaps)
+// * Maybe can have a very limited selection of texture formats
+
+struct GpuTex; // Read-only
+struct GpuRWTex; // Read-write
+
 // Kernel API
 // ------------------------------------------------------------------------------------------------
 
