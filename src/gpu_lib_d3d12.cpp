@@ -3,6 +3,7 @@
 #include <stdio.h>
 
 #include <sfz_cpp.hpp>
+#include <skipifzero_pool.hpp>
 
 // Windows.h
 #pragma warning(push, 0)
@@ -94,11 +95,14 @@ static bool checkD3D12(const char* file, i32 line, HRESULT res)
 // Checks result (HRESULT) from D3D call and log if not success, returns true on success
 #define CHECK_D3D12(res) checkD3D12(__FILE__, __LINE__, (res))
 
-/*static i32 utf8ToWide(wchar_t* wideOut, u32 numWideChars, const char* utf8In)
+// String functions
+// ------------------------------------------------------------------------------------------------
+
+static i32 utf8ToWide(wchar_t* wideOut, u32 numWideChars, const char* utf8In)
 {
 	const i32 numCharsWritten = MultiByteToWideChar(CP_UTF8, 0, utf8In, -1, wideOut, numWideChars);
 	return numCharsWritten;
-}*/
+}
 
 // Debug messages
 // ------------------------------------------------------------------------------------------------
@@ -137,6 +141,12 @@ static void logDebugMessages(ID3D12InfoQueue* info_queue)
 // gpu_lib
 // ------------------------------------------------------------------------------------------------
 
+sfz_struct(GpuKernelInfo) {
+	ComPtr<ID3D12PipelineState> pso;
+	ComPtr<ID3D12RootSignature> root_sig; // TODO: Global root sig?
+	i32x3 group_dims;
+};
+
 sfz_struct(GpuLib) {
 	GpuLibInitCfg cfg;
 
@@ -147,6 +157,14 @@ sfz_struct(GpuLib) {
 
 	// GPU Heap
 	ComPtr<ID3D12Resource> gpu_heap;
+
+	// DXC compiler
+	ComPtr<IDxcUtils> dxc_utils; // Not thread-safe
+	ComPtr<IDxcCompiler3> dxc_compiler; // Not thread-safe
+	ComPtr<IDxcIncludeHandler> dxc_include_handler; // Not thread-safe
+
+	// Kernels
+	sfz::Pool<GpuKernelInfo> kernels;
 };
 
 // Init API
@@ -160,14 +178,14 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfg)
 		// Get debug interface
 		ComPtr<ID3D12Debug1> debug_interface;
 		if (!CHECK_D3D12(D3D12GetDebugInterface(IID_PPV_ARGS(&debug_interface)))) {
-			return nullptr;;
+			return nullptr;
 		}
 
 		// Enable debug layer and GPU based validation
 		debug_interface->EnableDebugLayer();
 
 		// Enable GPU based debug mode if requested
-		if (cfg->debug_mode_gpu_validation) {
+		if (cfg->debug_shader_validation) {
 			debug_interface->SetEnableGPUBasedValidation(TRUE);
 		}
 	}
@@ -253,6 +271,26 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfg)
 		}
 	}
 
+	ComPtr<IDxcUtils> dxc_utils;
+	ComPtr<IDxcCompiler3> dxc_compiler;
+	ComPtr<IDxcIncludeHandler> dxc_include_handler;
+	{
+		if (!CHECK_D3D12(DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&dxc_utils)))) {
+			printf("[gpu_lib]: Could not initialize DXC utils.");
+			return nullptr;
+		}
+
+		if (!CHECK_D3D12(DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&dxc_compiler)))) {
+			printf("[gpu_lib]: Could not initialize DXC compiler.");
+			return nullptr;
+		}
+
+		if (!CHECK_D3D12(dxc_utils->CreateDefaultIncludeHandler(&dxc_include_handler))) {
+			printf("[gpu_lib]: Could not create DXC include handler.");
+			return nullptr;
+		}
+	}
+
 	GpuLib* gpu = sfz_new<GpuLib>(cfg->cpu_allocator, sfz_dbg("GpuLib"));
 	*gpu = {};
 	gpu->cfg = *cfg;
@@ -262,6 +300,12 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfg)
 	gpu->info_queue = info_queue;
 
 	gpu->gpu_heap = gpu_heap;
+
+	gpu->dxc_utils = dxc_utils;
+	gpu->dxc_compiler = dxc_compiler;
+	gpu->dxc_include_handler = dxc_include_handler;
+
+	gpu->kernels.init(cfg->max_num_kernels, cfg->cpu_allocator, sfz_dbg("GpuLib::kernels"));
 
 	return gpu;
 }
@@ -278,7 +322,7 @@ sfz_extern_c void gpuLibDestroy(GpuLib* gpu)
 
 sfz_extern_c GpuPtr gpuMalloc(GpuLib* gpu, u32 num_bytes)
 {
-	return GPU_NULL;
+	return GPU_NULLPTR;
 }
 
 sfz_extern_c void gpuFree(GpuLib* gpu, GpuPtr ptr)
@@ -289,35 +333,196 @@ sfz_extern_c void gpuFree(GpuLib* gpu, GpuPtr ptr)
 // Kernel API
 // ------------------------------------------------------------------------------------------------
 
-sfz_extern_c GpuKernelHandle gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc)
+sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc)
 {
-	return GPU_NULL_KERNEL;
+	// Compile shader
+	ComPtr<IDxcBlob> dxil_blob;
+	i32x3 group_dims = i32x3_splat(0);
+	{
+		// Create source blob
+		// TODO: From file please
+		ComPtr<IDxcBlobEncoding> source_blob;
+		if (!CHECK_D3D12(gpu->dxc_utils->CreateBlob(desc->src, strlen(desc->src), CP_UTF8, &source_blob))) {
+			printf("[gpulib]: Failed to create source blob\n");
+			return GPU_NULL_KERNEL;
+		}
+		DxcBuffer src_buffer = {};
+		src_buffer.Ptr = source_blob->GetBufferPointer();
+		src_buffer.Size = source_blob->GetBufferSize();
+		src_buffer.Encoding = 0;
+
+		// Compiler arguments
+		constexpr u32 ENTRY_MAX_LEN = 32;
+		wchar_t entry_wide[ENTRY_MAX_LEN] = {};
+		utf8ToWide(entry_wide, ENTRY_MAX_LEN, desc->entry);
+		constexpr u32 NUM_ARGS = 11;
+		LPCWSTR args[NUM_ARGS] = {
+			L"-E",
+			entry_wide,
+			L"-T",
+			L"cs_6_6",
+			L"-HV 2021",
+			L"-enable-16bit-types",
+			L"-O3",
+			L"-Zi",
+			L"-Qembed_debug",
+			DXC_ARG_PACK_MATRIX_ROW_MAJOR,
+			L"-DGPU_LIB_HLSL"
+		};
+
+		// Compile shader
+		ComPtr<IDxcResult> compile_res;
+		CHECK_D3D12(gpu->dxc_compiler->Compile(
+			&src_buffer, args, NUM_ARGS, gpu->dxc_include_handler.Get(), IID_PPV_ARGS(&compile_res)));
+		{
+			ComPtr<IDxcBlobUtf8> error_msgs;
+			CHECK_D3D12(compile_res->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&error_msgs), nullptr));
+			if (error_msgs && error_msgs->GetStringLength() > 0) {
+				printf("[gpu_lib]: %s\n", error_msgs->GetBufferPointer());
+			}
+
+			ComPtr<IDxcBlobUtf8> remarks;
+			CHECK_D3D12(compile_res->GetOutput(DXC_OUT_REMARKS, IID_PPV_ARGS(&remarks), nullptr));
+			if (remarks && remarks->GetStringLength() > 0) {
+				printf("[gpu_lib]: %s\n", remarks->GetBufferPointer());
+			}
+
+			HRESULT hr = {};
+			CHECK_D3D12(compile_res->GetStatus(&hr));
+			const bool compile_success = CHECK_D3D12(hr);
+			if (!compile_success) {
+				printf("[gpu_lib]: Failed to compile kernel\n");
+				return GPU_NULL_KERNEL;
+			}
+		}
+
+		// Get compiled DXIL
+		CHECK_D3D12(compile_res->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&dxil_blob), nullptr));
+		ComPtr<IDxcBlob> reflection_data;
+
+		// Get reflection data
+		ComPtr<ID3D12ShaderReflection> reflection;
+		CHECK_D3D12(compile_res->GetOutput(DXC_OUT_REFLECTION, IID_PPV_ARGS(&reflection_data), nullptr));
+		DxcBuffer reflection_buffer = {};
+		reflection_buffer.Ptr = reflection_data->GetBufferPointer();
+		reflection_buffer.Size = reflection_data->GetBufferSize();
+		reflection_buffer.Encoding = 0;
+		CHECK_D3D12(gpu->dxc_utils->CreateReflection(&reflection_buffer, IID_PPV_ARGS(&reflection)));
+
+		// Get group dimensions from reflection
+		u32 group_dim_x = 0, group_dim_y = 0, group_dim_z = 0;
+		reflection->GetThreadGroupSize(&group_dim_x, &group_dim_y, &group_dim_z);
+		group_dims = i32x3_init((i32)group_dim_x, (i32)group_dim_y, (i32)group_dim_z);
+
+		// Get info from reflection data
+		//D3D12_SHADER_DESC shader_desc = {};
+		//CHECK_D3D12(reflection->GetDesc(&shader_desc));
+	}
+
+	// Create root signature
+	ComPtr<ID3D12RootSignature> root_sig;
+	{
+		constexpr u32 NUM_ROOT_PARAMS = 1;
+		D3D12_ROOT_PARAMETER1 root_params[NUM_ROOT_PARAMS] = {};
+
+		root_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+		root_params[0].Descriptor.ShaderRegister = 0;
+		root_params[0].Descriptor.RegisterSpace = 0;
+		root_params[0].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC;
+		root_params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+		D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_sig_desc = {};
+		root_sig_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+		root_sig_desc.Desc_1_1.NumParameters = NUM_ROOT_PARAMS;
+		root_sig_desc.Desc_1_1.pParameters = root_params;
+		root_sig_desc.Desc_1_1.NumStaticSamplers = 0;
+		root_sig_desc.Desc_1_1.pStaticSamplers = nullptr;
+		root_sig_desc.Desc_1_1.Flags =
+			D3D12_ROOT_SIGNATURE_FLAG_DENY_VERTEX_SHADER_ROOT_ACCESS |
+			D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+			D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+			D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS |
+			D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS |
+			D3D12_ROOT_SIGNATURE_FLAG_DENY_AMPLIFICATION_SHADER_ROOT_ACCESS |
+			D3D12_ROOT_SIGNATURE_FLAG_DENY_MESH_SHADER_ROOT_ACCESS;
+
+		ComPtr<ID3DBlob> blob;
+		ComPtr<ID3DBlob> error_blob;
+		const bool serialize_success = CHECK_D3D12(D3D12SerializeVersionedRootSignature(
+			&root_sig_desc, &blob, &error_blob));
+		if (!serialize_success) {
+			printf("[gpu_lib]: Failed to serialize root signature: %s\n",
+				error_blob->GetBufferPointer());
+			return GPU_NULL_KERNEL;
+		}
+
+		const bool create_success = CHECK_D3D12(gpu->device->CreateRootSignature(
+			0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root_sig)));
+		if (!create_success) {
+			printf("[gpu_lib]: Failed to create root signature\n");
+			return GPU_NULL_KERNEL;
+		} 
+	}
+
+	// Create PSO (Pipeline State Object)
+	ComPtr<ID3D12PipelineState> pso;
+	{
+		D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc = {};
+		pso_desc.pRootSignature = root_sig.Get();
+		pso_desc.CS.pShaderBytecode = dxil_blob->GetBufferPointer();
+		pso_desc.CS.BytecodeLength = dxil_blob->GetBufferSize();
+		pso_desc.NodeMask = 0;
+		pso_desc.CachedPSO = {};
+		pso_desc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+
+		const bool pso_success = CHECK_D3D12(gpu->device->CreateComputePipelineState(
+			&pso_desc, IID_PPV_ARGS(&pso)));
+		if (!pso_success) {
+			printf("[gpu_lib]: Failed to create pso\n");
+			return GPU_NULL_KERNEL;
+		}
+	}
+
+	// Store kernel data and return handle
+	const SfzHandle handle = gpu->kernels.allocate();
+	if (handle == SFZ_NULL_HANDLE) return GPU_NULL_KERNEL;
+	GpuKernelInfo& kernel_info = *gpu->kernels.get(handle);
+	kernel_info.pso = pso;
+	kernel_info.root_sig = root_sig;
+	kernel_info.group_dims = group_dims;
+	return GpuKernel{ handle.bits };
 }
 
-sfz_extern_c void gpuKernelDestroy(GpuLib* gpu, GpuKernelHandle kernel)
+sfz_extern_c void gpuKernelDestroy(GpuLib* gpu, GpuKernel kernel)
 {
-
+	const SfzHandle handle = SfzHandle{ kernel.handle };
+	GpuKernelInfo* info = gpu->kernels.get(handle);
+	if (info == nullptr) return;
+	gpu->kernels.deallocate(handle);
 }
 
-sfz_extern_c i32x3 gpuKernelGetGroupDims(const GpuLib* gpu, GpuKernelHandle kernel)
+sfz_extern_c i32x3 gpuKernelGetGroupDims(const GpuLib* gpu, GpuKernel kernel)
 {
-	return i32x3_splat(0);
+	const SfzHandle handle = SfzHandle{ kernel.handle };
+	const GpuKernelInfo* info = gpu->kernels.get(handle);
+	if (info == nullptr) return i32x3_splat(0);
+	return info->group_dims;
 }
 
 // Submission API
 // ------------------------------------------------------------------------------------------------
 
-sfz_extern_c void gpuEnqueuKernel1(GpuLib* gpu, GpuKernelHandle kernel, i32 num_groups)
+sfz_extern_c void gpuEnqueueKernel1(GpuLib* gpu, GpuKernel kernel, i32 num_groups)
 {
 
 }
 
-sfz_extern_c void gpuEnqueueKernel2(GpuLib* gpu, GpuKernelHandle kernel, i32x2 num_groups)
+sfz_extern_c void gpuEnqueueKernel2(GpuLib* gpu, GpuKernel kernel, i32x2 num_groups)
 {
 
 }
 
-sfz_extern_c void gpuEnqueueKernel3(GpuLib* gpu, GpuKernelHandle kernel, i32x3 num_groups)
+sfz_extern_c void gpuEnqueueKernel3(GpuLib* gpu, GpuKernel kernel, i32x3 num_groups)
 {
 
 }
