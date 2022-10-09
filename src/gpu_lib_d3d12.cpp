@@ -755,7 +755,7 @@ sfz_extern_c void gpuQueueDispatch(
 	cmd_list_info.cmd_list->Dispatch(u32(num_groups.x), u32(num_groups.y), u32(num_groups.z));
 }
 
-sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu, i32x2 window_res)
+sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu, i32x2 window_res, f32x4 clear_color)
 {
 	if (gpu->swapchain == nullptr) return;
 	if (window_res.x <= 0 || window_res.y <= 0) {
@@ -837,6 +837,9 @@ sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu, i32x2 window_res)
 
 	// Set swapchain render target
 	cmd_list_info.cmd_list->OMSetRenderTargets(1, &fb.rtv_descriptor, FALSE, nullptr);
+
+	// Clear render target
+	cmd_list_info.cmd_list->ClearRenderTargetView(fb.rtv_descriptor, &clear_color.x, 0, nullptr);
 }
 
 sfz_extern_c void gpuQueueSwapchainEnd(GpuLib* gpu)
@@ -864,7 +867,7 @@ sfz_extern_c void gpuSwapchainPresent(GpuLib* gpu, bool vsync)
 {
 	// Present swapchain's render target
 	const u32 vsync_val = vsync ? 1 : 0; // Can specify 2-4 for vsync:ing on not every frame
-	const u32 flags = gpu->cfg.allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
+	const u32 flags = (!vsync && gpu->cfg.allow_tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
 	if (!CHECK_D3D12(gpu->swapchain->Present(vsync_val, flags))) {
 		printf("[gpu_lib]: Present failure.\n");
 		return;

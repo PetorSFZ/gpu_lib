@@ -129,7 +129,7 @@ inline void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32 num_groups)
 }
 #endif // __cplusplus
 
-sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu, i32x2 window_res);
+sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu, i32x2 window_res, f32x4 clear_color);
 sfz_extern_c void gpuQueueSwapchainEnd(GpuLib* gpu);
 sfz_extern_c void gpuSwapchainPresent(GpuLib* gpu, bool vsync);
 

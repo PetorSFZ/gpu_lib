@@ -101,6 +101,8 @@ void CSMain(
 		gpuKernelDestroy(gpu, kernel);
 	};
 
+	f32 clear_value = 0.0f;
+
 	// Run our main loop
 	bool running = true;
 	while (running) {
@@ -129,7 +131,9 @@ void CSMain(
 		i32x2 res = i32x2_splat(0);
 		SDL_GL_GetDrawableSize(window, &res.x, &res.y);
 
-		gpuQueueSwapchainBegin(gpu, res);
+		clear_value += 0.01f;
+		if (1.0f < clear_value) clear_value = 0.0f;
+		gpuQueueSwapchainBegin(gpu, res, f32x4_init(clear_value, 0.0f, 0.0f, 0.0f));
 
 		struct {
 			i32x4 params;
@@ -138,7 +142,7 @@ void CSMain(
 
 		gpuQueueSwapchainEnd(gpu);
 		gpuSubmitQueuedWork(gpu);
-		gpuSwapchainPresent(gpu, false);
+		gpuSwapchainPresent(gpu, true);
 	}
 	gpuFlush(gpu);
 
