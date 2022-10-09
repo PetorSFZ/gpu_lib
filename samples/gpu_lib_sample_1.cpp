@@ -38,22 +38,31 @@ i32 main(i32 argc, char* argv[])
 
 	constexpr char KERNEL_SRC[] =
 R"(
-	typedef int i32;
-	typedef int3 i32x3;
 
-	[numthreads(16, 16, 1)]
-void CSMain(
-	i32x3 groupIdx : SV_GroupID, // Index of group
-	i32 groupFlatIdx : SV_GroupIndex, // Flattened version of group index
-	i32x3 groupThreadIdx : SV_GroupThreadID, // Index of thread within group
-	i32x3 dispatchThreadIdx : SV_DispatchThreadID) // Global index of thread
-{
+typedef int i32;
+typedef int3 i32x3;
+typedef int4 i32x4;
+
+RWByteAddressBuffer gpu_global_heap : register(u0);
+
+cbuffer LaunchParams : register(b0) {
+	i32x4 params;
 }
+
+[numthreads(16, 16, 1)]
+void CSMain(
+	i32x3 group_idx : SV_GroupID, // Index of group
+	i32 group_flat_idx : SV_GroupIndex, // Flattened version of group index
+	i32x3 group_thread_idx : SV_GroupThreadID, // Index of thread within group
+	i32x3 dispatch_thread_idx : SV_DispatchThreadID) // Global index of thread
+{
+	gpu_global_heap.Store(0, params.x);
+}
+
 )";
 	const GpuKernelDesc kernel_desc = GpuKernelDesc{
 		.name = "Test",
-		.src = KERNEL_SRC,
-		.entry = "CSMain"
+		.src = KERNEL_SRC
 	};
 	const GpuKernel kernel = gpuKernelInit(gpu, &kernel_desc);
 	sfz_defer[=]() {
@@ -62,7 +71,10 @@ void CSMain(
 
 	for (i32 i = 0; i < 100; i++) {
 
-		gpuQueueDispatch2(gpu, kernel, i32x2_init(1, 1));
+		struct {
+			i32x4 params;
+		} params;
+		gpuQueueDispatch(gpu, kernel, i32x3_init(1, 1, 1), params);
 
 		gpuSubmitQueuedWork(gpu);
 	}

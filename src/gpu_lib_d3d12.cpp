@@ -143,6 +143,9 @@ static void logDebugMessages(ID3D12InfoQueue* info_queue)
 
 sfz_constant u32 GPU_NUM_CMD_LISTS = 3;
 
+sfz_constant u32 GPU_ROOT_PARAM_GLOBAL_HEAP_IDX = 0;
+sfz_constant u32 GPU_ROOT_PARAM_LAUNCH_PARAMS_IDX = 1;
+
 sfz_struct(GpuCmdListInfo) {
 	ComPtr<ID3D12GraphicsCommandList> cmd_list;
 	ComPtr<ID3D12CommandAllocator> cmd_allocator;
@@ -151,8 +154,9 @@ sfz_struct(GpuCmdListInfo) {
 
 sfz_struct(GpuKernelInfo) {
 	ComPtr<ID3D12PipelineState> pso;
-	ComPtr<ID3D12RootSignature> root_sig; // TODO: Global root sig?
+	ComPtr<ID3D12RootSignature> root_sig;
 	i32x3 group_dims;
+	u32 launch_params_size;
 };
 
 sfz_struct(GpuLib) {
@@ -430,6 +434,7 @@ sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc)
 	// Compile shader
 	ComPtr<IDxcBlob> dxil_blob;
 	i32x3 group_dims = i32x3_splat(0);
+	u32 launch_params_size = 0;
 	{
 		// Create source blob
 		// TODO: From file please
@@ -444,13 +449,13 @@ sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc)
 		src_buffer.Encoding = 0;
 
 		// Compiler arguments
-		constexpr u32 ENTRY_MAX_LEN = 32;
+		/*constexpr u32 ENTRY_MAX_LEN = 32;
 		wchar_t entry_wide[ENTRY_MAX_LEN] = {};
-		utf8ToWide(entry_wide, ENTRY_MAX_LEN, desc->entry);
+		utf8ToWide(entry_wide, ENTRY_MAX_LEN, desc->entry);*/
 		constexpr u32 NUM_ARGS = 11;
 		LPCWSTR args[NUM_ARGS] = {
 			L"-E",
-			entry_wide,
+			L"CSMain",
 			L"-T",
 			L"cs_6_6",
 			L"-HV 2021",
@@ -470,13 +475,13 @@ sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc)
 			ComPtr<IDxcBlobUtf8> error_msgs;
 			CHECK_D3D12(compile_res->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&error_msgs), nullptr));
 			if (error_msgs && error_msgs->GetStringLength() > 0) {
-				printf("[gpu_lib]: %s\n", error_msgs->GetBufferPointer());
+				printf("[gpu_lib]: %s\n", (const char*)error_msgs->GetBufferPointer());
 			}
 
 			ComPtr<IDxcBlobUtf8> remarks;
 			CHECK_D3D12(compile_res->GetOutput(DXC_OUT_REMARKS, IID_PPV_ARGS(&remarks), nullptr));
 			if (remarks && remarks->GetStringLength() > 0) {
-				printf("[gpu_lib]: %s\n", remarks->GetBufferPointer());
+				printf("[gpu_lib]: %s\n", (const char*)remarks->GetBufferPointer());
 			}
 
 			HRESULT hr = {};
@@ -506,26 +511,52 @@ sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc)
 		reflection->GetThreadGroupSize(&group_dim_x, &group_dim_y, &group_dim_z);
 		group_dims = i32x3_init((i32)group_dim_x, (i32)group_dim_y, (i32)group_dim_z);
 
-		// Get info from reflection data
-		//D3D12_SHADER_DESC shader_desc = {};
-		//CHECK_D3D12(reflection->GetDesc(&shader_desc));
+		// Get launch parameters info from reflection
+		D3D12_SHADER_DESC shader_desc = {};
+		CHECK_D3D12(reflection->GetDesc(&shader_desc));
+		if (shader_desc.ConstantBuffers > 1) {
+			printf("[gpu_lib]: More than 1 constant buffer bound, not allowed.\n");
+			return GPU_NULL_KERNEL;
+		}
+		if (shader_desc.ConstantBuffers == 1) {
+			ID3D12ShaderReflectionConstantBuffer* cbuffer_reflection =
+				reflection->GetConstantBufferByIndex(0);
+			D3D12_SHADER_BUFFER_DESC cbuffer = {};
+			CHECK_D3D12(cbuffer_reflection->GetDesc(&cbuffer));
+			launch_params_size = cbuffer.Size;
+			if (launch_params_size > GPU_LAUNCH_PARAMS_MAX_SIZE) {
+				printf("[gpu_lib]: Launch parameters too big, %u bytes, max %u bytes allowed\n",
+					launch_params_size, GPU_LAUNCH_PARAMS_MAX_SIZE);
+				return GPU_NULL_KERNEL;
+			}
+		}
 	}
 
 	// Create root signature
 	ComPtr<ID3D12RootSignature> root_sig;
 	{
-		constexpr u32 NUM_ROOT_PARAMS = 1;
-		D3D12_ROOT_PARAMETER1 root_params[NUM_ROOT_PARAMS] = {};
+		constexpr u32 MAX_NUM_ROOT_PARAMS = 2;
+		const u32 num_root_params =
+			launch_params_size != 0 ? MAX_NUM_ROOT_PARAMS : (MAX_NUM_ROOT_PARAMS - 1);
+		D3D12_ROOT_PARAMETER1 root_params[MAX_NUM_ROOT_PARAMS] = {};
 
-		root_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-		root_params[0].Descriptor.ShaderRegister = 0;
-		root_params[0].Descriptor.RegisterSpace = 0;
-		root_params[0].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC;
-		root_params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		root_params[GPU_ROOT_PARAM_GLOBAL_HEAP_IDX].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+		root_params[GPU_ROOT_PARAM_GLOBAL_HEAP_IDX].Descriptor.ShaderRegister = 0;
+		root_params[GPU_ROOT_PARAM_GLOBAL_HEAP_IDX].Descriptor.RegisterSpace = 0;
+		root_params[GPU_ROOT_PARAM_GLOBAL_HEAP_IDX].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC;
+		root_params[GPU_ROOT_PARAM_GLOBAL_HEAP_IDX].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+		if (launch_params_size != 0) {
+			root_params[GPU_ROOT_PARAM_LAUNCH_PARAMS_IDX].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+			root_params[GPU_ROOT_PARAM_LAUNCH_PARAMS_IDX].Constants.ShaderRegister = 0;
+			root_params[GPU_ROOT_PARAM_LAUNCH_PARAMS_IDX].Constants.RegisterSpace = 0;
+			root_params[GPU_ROOT_PARAM_LAUNCH_PARAMS_IDX].Constants.Num32BitValues = launch_params_size / 4;
+			root_params[GPU_ROOT_PARAM_LAUNCH_PARAMS_IDX].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		}
 
 		D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_sig_desc = {};
 		root_sig_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
-		root_sig_desc.Desc_1_1.NumParameters = NUM_ROOT_PARAMS;
+		root_sig_desc.Desc_1_1.NumParameters = num_root_params;
 		root_sig_desc.Desc_1_1.pParameters = root_params;
 		root_sig_desc.Desc_1_1.NumStaticSamplers = 0;
 		root_sig_desc.Desc_1_1.pStaticSamplers = nullptr;
@@ -544,7 +575,7 @@ sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc)
 			&root_sig_desc, &blob, &error_blob));
 		if (!serialize_success) {
 			printf("[gpu_lib]: Failed to serialize root signature: %s\n",
-				error_blob->GetBufferPointer());
+				(const char*)error_blob->GetBufferPointer());
 			return GPU_NULL_KERNEL;
 		}
 
@@ -582,6 +613,7 @@ sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc)
 	kernel_info.pso = pso;
 	kernel_info.root_sig = root_sig;
 	kernel_info.group_dims = group_dims;
+	kernel_info.launch_params_size = launch_params_size;
 	return GpuKernel{ handle.bits };
 }
 
@@ -604,17 +636,8 @@ sfz_extern_c i32x3 gpuKernelGetGroupDims(const GpuLib* gpu, GpuKernel kernel)
 // Submission API
 // ------------------------------------------------------------------------------------------------
 
-sfz_extern_c void gpuQueueDispatch1(GpuLib* gpu, GpuKernel kernel, i32 num_groups)
-{
-	gpuQueueDispatch3(gpu, kernel, i32x3_init(num_groups, 1, 1));
-}
-
-sfz_extern_c void gpuQueueDispatch2(GpuLib* gpu, GpuKernel kernel, i32x2 num_groups)
-{
-	gpuQueueDispatch3(gpu, kernel, i32x3_init2(num_groups, 1));
-}
-
-sfz_extern_c void gpuQueueDispatch3(GpuLib* gpu, GpuKernel kernel, i32x3 num_groups)
+sfz_extern_c void gpuQueueDispatch(
+	GpuLib* gpu, GpuKernel kernel, i32x3 num_groups, const void* params, u32 params_size)
 {
 	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
 
@@ -626,6 +649,17 @@ sfz_extern_c void gpuQueueDispatch3(GpuLib* gpu, GpuKernel kernel, i32x3 num_gro
 	}
 	cmd_list_info.cmd_list->SetPipelineState(kernel_info->pso.Get());
 	cmd_list_info.cmd_list->SetComputeRootSignature(kernel_info->root_sig.Get());
+
+	// Set launch params
+	if (kernel_info->launch_params_size != params_size) {
+		printf("[gpu_lib]: Invalid sizeo of launch parameters, got %u bytes, expected %u bytes.\n",
+			params_size, kernel_info->launch_params_size);
+		return;
+	}
+	if (params_size != 0) {
+		cmd_list_info.cmd_list->SetComputeRoot32BitConstants(
+			GPU_ROOT_PARAM_LAUNCH_PARAMS_IDX, params_size / 4, params, 0);
+	}
 
 	// Dispatch
 	sfz_assert(0 < num_groups.x && 0 < num_groups.y && 0 < num_groups.z);

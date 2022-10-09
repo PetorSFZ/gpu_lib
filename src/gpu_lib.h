@@ -11,6 +11,8 @@ sfz_constant u32 GPU_HEAP_SYSTEM_RESERVED_SIZE = 8 * 1024 * 1024;
 sfz_constant u32 GPU_HEAP_MIN_SIZE = GPU_HEAP_SYSTEM_RESERVED_SIZE;
 sfz_constant u32 GPU_HEAP_MAX_SIZE = U32_MAX;
 
+sfz_constant u32 GPU_LAUNCH_PARAMS_MAX_SIZE = sizeof(u32) * 12;
+
 // Init API
 // ------------------------------------------------------------------------------------------------
 
@@ -84,7 +86,6 @@ sfz_constant GpuKernel GPU_NULL_KERNEL = {};
 sfz_struct(GpuKernelDesc) {
 	const char* name;
 	const char* src;
-	const char* entry;
 	//u32 num_defines;
 	//const char* const* defines;
 };
@@ -97,9 +98,39 @@ sfz_extern_c i32x3 gpuKernelGetGroupDims(const GpuLib* gpu, GpuKernel kernel);
 // Submission API
 // ------------------------------------------------------------------------------------------------
 
-sfz_extern_c void gpuQueueDispatch1(GpuLib* gpu, GpuKernel kernel, i32 num_groups);
-sfz_extern_c void gpuQueueDispatch2(GpuLib* gpu, GpuKernel kernel, i32x2 num_groups);
-sfz_extern_c void gpuQueueDispatch3(GpuLib* gpu, GpuKernel kernel, i32x3 num_groups);
+sfz_extern_c void gpuQueueDispatch(
+	GpuLib* gpu, GpuKernel kernel, i32x3 num_groups, const void* params, u32 params_size);
+
+#ifdef __cplusplus
+template<typename T> 
+void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32x3 num_groups, const T& params)
+{
+	return gpuQueueDispatch(gpu, kernel, num_groups, &params, sizeof(T));
+}
+template<typename T>
+void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32x2 num_groups, const T& params)
+{
+	return gpuQueueDispatch(gpu, kernel, i32x3_init2(num_groups, 1), &params, sizeof(T));
+}
+template<typename T>
+void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32 num_groups, const T& params)
+{
+	return gpuQueueDispatch(gpu, kernel, i32x3_init(num_groups, 1, 1), &params, sizeof(T));
+}
+
+inline void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32x3 num_groups)
+{
+	return gpuQueueDispatch(gpu, kernel, num_groups, nullptr, 0);
+}
+inline void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32x2 num_groups)
+{
+	return gpuQueueDispatch(gpu, kernel, i32x3_init2(num_groups, 1));
+}
+inline void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32 num_groups)
+{
+	return gpuQueueDispatch(gpu, kernel, i32x3_init(num_groups, 1, 1));
+}
+#endif // __cplusplus
 
 sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu);
 sfz_extern_c void gpuFlush(GpuLib* gpu);
