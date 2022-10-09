@@ -543,7 +543,8 @@ sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc)
 		root_params[GPU_ROOT_PARAM_GLOBAL_HEAP_IDX].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
 		root_params[GPU_ROOT_PARAM_GLOBAL_HEAP_IDX].Descriptor.ShaderRegister = 0;
 		root_params[GPU_ROOT_PARAM_GLOBAL_HEAP_IDX].Descriptor.RegisterSpace = 0;
-		root_params[GPU_ROOT_PARAM_GLOBAL_HEAP_IDX].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC;
+		// Note: UAV is written to during command list execution, thus it MUST be volatile.
+		root_params[GPU_ROOT_PARAM_GLOBAL_HEAP_IDX].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
 		root_params[GPU_ROOT_PARAM_GLOBAL_HEAP_IDX].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
 		if (launch_params_size != 0) {
@@ -649,6 +650,11 @@ sfz_extern_c void gpuQueueDispatch(
 	}
 	cmd_list_info.cmd_list->SetPipelineState(kernel_info->pso.Get());
 	cmd_list_info.cmd_list->SetComputeRootSignature(kernel_info->root_sig.Get());
+
+	// Set inline descriptors
+	// TODO: This could probably be done only once somehow
+	cmd_list_info.cmd_list->SetComputeRootUnorderedAccessView(
+		GPU_ROOT_PARAM_GLOBAL_HEAP_IDX, gpu->gpu_heap->GetGPUVirtualAddress());
 
 	// Set launch params
 	if (kernel_info->launch_params_size != params_size) {

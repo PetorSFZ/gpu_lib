@@ -1,10 +1,13 @@
+#include <stdio.h>
+
+#include <SDL.h>
+#include <SDL_syswm.h>
+
 #include <sfz.h>
 #include <sfz_defer.hpp>
 #include <skipifzero_allocators.hpp>
 
 #include <gpu_lib.h>
-
-#include <stdio.h>
 
 // Main
 // ------------------------------------------------------------------------------------------------
@@ -15,6 +18,31 @@ i32 main(i32 argc, char* argv[])
 {
 	(void)argc;
 	(void)argv;
+
+	// Init SDL2
+	if (SDL_Init(SDL_INIT_EVENTS | SDL_INIT_VIDEO) < 0) {
+		printf("SDL_Init() failed: %s", SDL_GetError());
+		return 1;
+	}
+	sfz_defer[]() { SDL_Quit(); };
+
+	// Create window
+	SDL_Window* window = SDL_CreateWindow(
+		"[gpu_lib] Sample 1",
+		SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+		800, 800,
+		SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE);
+	if (window == NULL) {
+		printf("SDL_CreateWindow() failed: %s\n", SDL_GetError());
+		return 1;
+	}
+	sfz_defer[=]() { SDL_DestroyWindow(window); };
+
+	// Grab window handle
+	SDL_SysWMinfo wm_info = {};
+	SDL_VERSION(&wm_info.version);
+	if (!SDL_GetWindowWMInfo(window, &wm_info)) return 1;
+	const HWND window_handle = wm_info.info.win.window;
 
 	// Initialize global cpu allocator
 	global_cpu_allocator = sfz::createStandardAllocator();
@@ -69,7 +97,33 @@ void CSMain(
 		gpuKernelDestroy(gpu, kernel);
 	};
 
-	for (i32 i = 0; i < 100; i++) {
+	// Run our main loop
+	bool running = true;
+	while (running) {
+
+		// Query SDL events, loop wrapped in a lambda so we can continue to next iteration of main
+		// loop. "return false;" == continue to next iteration
+		if (![&]() -> bool {
+			SDL_Event event = {};
+			while (SDL_PollEvent(&event) != 0) {
+				switch (event.type) {
+				case SDL_QUIT:
+					running = false;
+					return false;
+				case SDL_KEYUP:
+					if (event.key.keysym.sym == SDLK_ESCAPE) {
+						running = false;
+						return false;
+					}
+					break;
+				}
+			}
+			return true;
+		}()) continue;
+
+		// Query drawable width and height and update ZeroG context
+		i32x2 res = i32x2_splat(0);
+		SDL_GL_GetDrawableSize(window, &res.x, &res.y);
 
 		struct {
 			i32x4 params;

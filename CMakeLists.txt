@@ -65,6 +65,10 @@ add_subdirectory(${EXTERNALS_DIR}/D3D12AgilitySDK)
 # ${DXC_FOUND}, ${DXC_INCLUDE_DIRS}, ${DXC_LIBRARIES}, ${DXC_RUNTIME_FILES}
 add_subdirectory(${EXTERNALS_DIR}/dxc)
 
+# SDL2
+# ${SDL2_FOUND}, ${SDL2_INCLUDE_DIRS}, ${SDL2_LIBRARIES} and ${SDL2_RUNTIME_FILES}
+add_subdirectory(${EXTERNALS_DIR}/sdl2 ${CMAKE_BINARY_DIR}/sdl2)
+
 # gpu_lib library
 # ------------------------------------------------------------------------------------------------
 
@@ -95,8 +99,12 @@ add_executable(gpu_lib_sample_1 ${SAMPLES_DIR}/gpu_lib_sample_1.cpp)
 target_include_directories(gpu_lib_sample_1 PUBLIC
 	${SRC_DIR}
 	${SAMPLES_DIR}
+	${SDL2_INCLUDE_DIRS}
 )
-target_link_libraries(gpu_lib_sample_1 gpu_lib)
+target_link_libraries(gpu_lib_sample_1
+	gpu_lib
+	${SDL2_LIBRARIES}
+)
 
 # File copying
 # ------------------------------------------------------------------------------------------------
@@ -125,7 +133,7 @@ function(copyRuntimeFilesToBinaryDir)
 	endif()
 endfunction()
 
-copyRuntimeFilesToBinaryDir(${DXC_RUNTIME_FILES})
+copyRuntimeFilesToBinaryDir(${SDL2_RUNTIME_FILES} ${DXC_RUNTIME_FILES})
 
 # Copy D3D12 Agility SDK to binary dir
 if(MSVC)
