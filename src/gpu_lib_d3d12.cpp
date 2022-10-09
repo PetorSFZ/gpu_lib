@@ -146,6 +146,7 @@ sfz_constant u32 GPU_NUM_CMD_LISTS = 3;
 sfz_struct(GpuCmdListInfo) {
 	ComPtr<ID3D12GraphicsCommandList> cmd_list;
 	ComPtr<ID3D12CommandAllocator> cmd_allocator;
+	u64 fence_value;
 };
 
 sfz_struct(GpuKernelInfo) {
@@ -167,6 +168,9 @@ sfz_struct(GpuLib) {
 
 	// Commands
 	ComPtr<ID3D12CommandQueue> cmd_queue;
+	ComPtr<ID3D12Fence> cmd_queue_fence;
+	HANDLE cmd_queue_fence_event;
+	u64 cmd_queue_fence_value;
 	GpuCmdListInfo cmd_lists[GPU_NUM_CMD_LISTS];
 	u32 curr_cmd_list;
 	GpuCmdListInfo& getCurrCmdList() { return cmd_lists[curr_cmd_list]; }
@@ -290,6 +294,8 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 
 	// Create command queue
 	ComPtr<ID3D12CommandQueue> cmd_queue;
+	ComPtr<ID3D12Fence> cmd_queue_fence;
+	HANDLE cmd_queue_fence_event = nullptr;
 	{
 		D3D12_COMMAND_QUEUE_DESC queue_desc = {};
 		queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -300,6 +306,13 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 			printf("[gpu_lib]: Could not create command queue.\n");
 			return nullptr;
 		}
+
+		if (!CHECK_D3D12(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&cmd_queue_fence)))) {
+			printf("[gpu_lib]: Could not create command queue fence.\n");
+			return nullptr;
+		}
+
+		cmd_queue_fence_event = CreateEventA(NULL, false, false, "gpu_lib_cmd_queue_fence_event");
 	}
 
 	// Create command lists
@@ -331,6 +344,8 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 				return nullptr;
 			}
 		}
+
+		info.fence_value = 0;
 	}
 
 	// Load DXC compiler
@@ -365,7 +380,9 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 	gpu->gpu_heap = gpu_heap;
 
 	gpu->cmd_queue = cmd_queue;
-
+	gpu->cmd_queue_fence = cmd_queue_fence;
+	gpu->cmd_queue_fence_event = cmd_queue_fence_event;
+	gpu->cmd_queue_fence_value = 0;
 	for (u32 i = 0; i < GPU_NUM_CMD_LISTS; i++) gpu->cmd_lists[i] = cmd_lists[i];
 	gpu->curr_cmd_list = 0;
 
@@ -381,6 +398,13 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 sfz_extern_c void gpuLibDestroy(GpuLib* gpu)
 {
 	if (gpu == nullptr) return;
+	
+	// Flush all in-flight commands
+	gpuFlush(gpu);
+	
+	// Destroy command queue's fence event
+	CloseHandle(gpu->cmd_queue_fence_event);
+
 	SfzAllocator* allocator = gpu->cfg.cpu_allocator;
 	sfz_delete(allocator, gpu);
 }
@@ -625,33 +649,28 @@ sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu)
 		cmd_lists[0] = cmd_list_info.cmd_list.Get();
 		gpu->cmd_queue->ExecuteCommandLists(1, cmd_lists);
 
-
-		/*gpu->cmd_queue->Signal(
-		CHECK_D3D12 mCommandQueue->Signal(mCommandQueueFence.Get(), mCommandQueueFenceValue);
-		u64 fence_value = mCommandQueueFenceValue++;
-		
-		void waitOnCpuInternal(u64 fenceValue) noexcept
-		{
-		if (!isFenceValueDone(fenceValue)) {
-			CHECK_D3D12 mCommandQueueFence->SetEventOnCompletion(
-				fenceValue, mCommandQueueFenceEvent);
-				// TODO: Don't wait forever
-				::WaitForSingleObject(mCommandQueueFenceEvent, INFINITE);
-			}
+		// Fence signalling
+		if (!CHECK_D3D12(gpu->cmd_queue->Signal(gpu->cmd_queue_fence.Get(), gpu->cmd_queue_fence_value))) {
+			printf("[gpu_lib]: Could not signal from command queue\n");
+			return;
 		}
-
-		bool isFenceValueDone(u64 fenceValue) noexcept
-		{
-			return mCommandQueueFence->GetCompletedValue() >= fenceValue;
-		}
-		
-		*/
+		// This command list is done once the value above is signalled
+		cmd_list_info.fence_value = gpu->cmd_queue_fence_value;
+		// Increment value we will signal next time
+		gpu->cmd_queue_fence_value += 1;
 	}
 
 	// Switch to next command list
 	{
 		gpu->curr_cmd_list = (gpu->curr_cmd_list + 1) % GPU_NUM_CMD_LISTS;
 		GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
+
+		// Wait until command list is done
+		if (gpu->cmd_queue_fence->GetCompletedValue() < cmd_list_info.fence_value) {
+			CHECK_D3D12(gpu->cmd_queue_fence->SetEventOnCompletion(
+				cmd_list_info.fence_value, gpu->cmd_queue_fence_event));
+			WaitForSingleObject(gpu->cmd_queue_fence_event, INFINITE);
+		}
 
 		if (!CHECK_D3D12(cmd_list_info.cmd_allocator->Reset())) {
 			printf("[gpu_lib]: Couldn't reset command allocator\n");
@@ -664,15 +683,19 @@ sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu)
 
 		/*
 		// Set descriptor heap
-		if (commandListType != D3D12_COMMAND_LIST_TYPE_COPY) {
-			ID3D12DescriptorHeap* heaps[] = { mDescriptorBuffer->descriptorHeap.Get() };
-			commandList->SetDescriptorHeaps(1, heaps);
-		}
+		ID3D12DescriptorHeap* heaps[] = { mDescriptorBuffer->descriptorHeap.Get() };
+		commandList->SetDescriptorHeaps(1, heaps);
 		*/
 	}
 }
 
 sfz_extern_c void gpuFlush(GpuLib* gpu)
 {
-
+	CHECK_D3D12(gpu->cmd_queue->Signal(gpu->cmd_queue_fence.Get(), gpu->cmd_queue_fence_value));
+	if (gpu->cmd_queue_fence->GetCompletedValue() < gpu->cmd_queue_fence_value) {
+		CHECK_D3D12(gpu->cmd_queue_fence->SetEventOnCompletion(
+			gpu->cmd_queue_fence_value, gpu->cmd_queue_fence_event));
+		WaitForSingleObject(gpu->cmd_queue_fence_event, INFINITE);
+	}
+	gpu->cmd_queue_fence_value += 1;
 }
