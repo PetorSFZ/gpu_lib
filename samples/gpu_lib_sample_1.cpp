@@ -25,7 +25,7 @@ i32 main(i32 argc, char* argv[])
 		.gpu_heap_size_bytes = 2u * 1024u * 1024u * 1024u,//U32_MAX,
 		.max_num_kernels = 128,
 		.debug_mode = true,
-		.debug_shader_validation = false
+		.debug_shader_validation = true
 	};
 	GpuLib* gpu = gpuLibInit(&gpu_init_cfg);
 	if (gpu == nullptr) {
@@ -60,6 +60,13 @@ void CSMain(
 		gpuKernelDestroy(gpu, kernel);
 	};
 
+	for (i32 i = 0; i < 100; i++) {
+
+		gpuQueueDispatch2(gpu, kernel, i32x2_init(1, 1));
+
+		gpuSubmitQueuedWork(gpu);
+	}
+	gpuFlush(gpu);
 
 	return 0;
 }

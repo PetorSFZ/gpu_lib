@@ -141,6 +141,13 @@ static void logDebugMessages(ID3D12InfoQueue* info_queue)
 // gpu_lib
 // ------------------------------------------------------------------------------------------------
 
+sfz_constant u32 GPU_NUM_CMD_LISTS = 3;
+
+sfz_struct(GpuCmdListInfo) {
+	ComPtr<ID3D12GraphicsCommandList> cmd_list;
+	ComPtr<ID3D12CommandAllocator> cmd_allocator;
+};
+
 sfz_struct(GpuKernelInfo) {
 	ComPtr<ID3D12PipelineState> pso;
 	ComPtr<ID3D12RootSignature> root_sig; // TODO: Global root sig?
@@ -158,6 +165,12 @@ sfz_struct(GpuLib) {
 	// GPU Heap
 	ComPtr<ID3D12Resource> gpu_heap;
 
+	// Commands
+	ComPtr<ID3D12CommandQueue> cmd_queue;
+	GpuCmdListInfo cmd_lists[GPU_NUM_CMD_LISTS];
+	u32 curr_cmd_list;
+	GpuCmdListInfo& getCurrCmdList() { return cmd_lists[curr_cmd_list]; }
+
 	// DXC compiler
 	ComPtr<IDxcUtils> dxc_utils; // Not thread-safe
 	ComPtr<IDxcCompiler3> dxc_compiler; // Not thread-safe
@@ -170,10 +183,14 @@ sfz_struct(GpuLib) {
 // Init API
 // ------------------------------------------------------------------------------------------------
 
-sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfg)
+sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 {
+	// Copy config so that we can make changes to it before finally storing it in the context
+	GpuLibInitCfg cfg = *cfgIn;
+	cfg.gpu_heap_size_bytes = u32_clamp(cfg.gpu_heap_size_bytes, GPU_HEAP_MIN_SIZE, GPU_HEAP_MAX_SIZE);
+
 	// Enable debug layers in debug mode
-	if (cfg->debug_mode) {
+	if (cfg.debug_mode) {
 
 		// Get debug interface
 		ComPtr<ID3D12Debug1> debug_interface;
@@ -185,7 +202,7 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfg)
 		debug_interface->EnableDebugLayer();
 
 		// Enable GPU based debug mode if requested
-		if (cfg->debug_shader_validation) {
+		if (cfg.debug_shader_validation) {
 			debug_interface->SetEnableGPUBasedValidation(TRUE);
 		}
 	}
@@ -194,7 +211,7 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfg)
 	ComPtr<IDXGIFactory6> dxgi_factory;
 	{
 		UINT flags = 0;
-		if (cfg->debug_mode) flags |= DXGI_CREATE_FACTORY_DEBUG;
+		if (cfg.debug_mode) flags |= DXGI_CREATE_FACTORY_DEBUG;
 		if (!CHECK_D3D12(CreateDXGIFactory2(flags, IID_PPV_ARGS(&dxgi_factory)))) {
 			return nullptr;
 		}
@@ -219,7 +236,7 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfg)
 
 	// Enable debug message in debug mode
 	ComPtr<ID3D12InfoQueue> info_queue;
-	if (cfg->debug_mode) {
+	if (cfg.debug_mode) {
 
 		if (!CHECK_D3D12(device->QueryInterface(IID_PPV_ARGS(&info_queue)))) {
 			return nullptr;
@@ -250,7 +267,7 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfg)
 		D3D12_RESOURCE_DESC desc = {};
 		desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
 		desc.Alignment = 0;
-		desc.Width = cfg->gpu_heap_size_bytes;
+		desc.Width = cfg.gpu_heap_size_bytes;
 		desc.Height = 1;
 		desc.DepthOrArraySize = 1;
 		desc.MipLevels = 1;
@@ -266,11 +283,57 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfg)
 			&heap_props, heap_flags, &desc, initial_res_state, nullptr, IID_PPV_ARGS(&gpu_heap)));
 		if (!heap_success) {
 			printf("[gpu_lib]: Could not allocate gpu heap of size %.2f MiB, exiting.",
-				f32(cfg->gpu_heap_size_bytes) / (1024.0f * 1024.0f));
+				f32(cfg.gpu_heap_size_bytes) / (1024.0f * 1024.0f));
 			return nullptr;
 		}
 	}
 
+	// Create command queue
+	ComPtr<ID3D12CommandQueue> cmd_queue;
+	{
+		D3D12_COMMAND_QUEUE_DESC queue_desc = {};
+		queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+		queue_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+		queue_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE; // D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT
+		queue_desc.NodeMask = 0;
+		if (!CHECK_D3D12(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&cmd_queue)))) {
+			printf("[gpu_lib]: Could not create command queue.\n");
+			return nullptr;
+		}
+	}
+
+	// Create command lists
+	GpuCmdListInfo cmd_lists[GPU_NUM_CMD_LISTS];
+	for (u32 i = 0; i < GPU_NUM_CMD_LISTS; i++) {
+		GpuCmdListInfo& info = cmd_lists[i];
+
+		if (!CHECK_D3D12(device->CreateCommandAllocator(
+			D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&info.cmd_allocator)))) {
+			printf("[gpu_lib]: Could not create command allocator.\n");
+			return nullptr;
+		}
+
+		if (!CHECK_D3D12(device->CreateCommandList(
+			0,
+			D3D12_COMMAND_LIST_TYPE_DIRECT,
+			info.cmd_allocator.Get(),
+			nullptr,
+			IID_PPV_ARGS(&info.cmd_list)))) {
+
+			printf("[gpu_lib]: Could not create command list.\n");
+			return nullptr;
+		}
+
+		// Close the non active command lists
+		if (i != 0) {
+			if (!CHECK_D3D12(info.cmd_list->Close())) {
+				printf("[gpu_lib]: Could not close command list after creation.\n");
+				return nullptr;
+			}
+		}
+	}
+
+	// Load DXC compiler
 	ComPtr<IDxcUtils> dxc_utils;
 	ComPtr<IDxcCompiler3> dxc_compiler;
 	ComPtr<IDxcIncludeHandler> dxc_include_handler;
@@ -291,9 +354,9 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfg)
 		}
 	}
 
-	GpuLib* gpu = sfz_new<GpuLib>(cfg->cpu_allocator, sfz_dbg("GpuLib"));
+	GpuLib* gpu = sfz_new<GpuLib>(cfg.cpu_allocator, sfz_dbg("GpuLib"));
 	*gpu = {};
-	gpu->cfg = *cfg;
+	gpu->cfg = cfg;
 
 	gpu->dxgi = dxgi;
 	gpu->device = device;
@@ -301,11 +364,16 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfg)
 
 	gpu->gpu_heap = gpu_heap;
 
+	gpu->cmd_queue = cmd_queue;
+
+	for (u32 i = 0; i < GPU_NUM_CMD_LISTS; i++) gpu->cmd_lists[i] = cmd_lists[i];
+	gpu->curr_cmd_list = 0;
+
 	gpu->dxc_utils = dxc_utils;
 	gpu->dxc_compiler = dxc_compiler;
 	gpu->dxc_include_handler = dxc_include_handler;
 
-	gpu->kernels.init(cfg->max_num_kernels, cfg->cpu_allocator, sfz_dbg("GpuLib::kernels"));
+	gpu->kernels.init(cfg.max_num_kernels, cfg.cpu_allocator, sfz_dbg("GpuLib::kernels"));
 
 	return gpu;
 }
@@ -512,24 +580,96 @@ sfz_extern_c i32x3 gpuKernelGetGroupDims(const GpuLib* gpu, GpuKernel kernel)
 // Submission API
 // ------------------------------------------------------------------------------------------------
 
-sfz_extern_c void gpuEnqueueKernel1(GpuLib* gpu, GpuKernel kernel, i32 num_groups)
+sfz_extern_c void gpuQueueDispatch1(GpuLib* gpu, GpuKernel kernel, i32 num_groups)
 {
-
+	gpuQueueDispatch3(gpu, kernel, i32x3_init(num_groups, 1, 1));
 }
 
-sfz_extern_c void gpuEnqueueKernel2(GpuLib* gpu, GpuKernel kernel, i32x2 num_groups)
+sfz_extern_c void gpuQueueDispatch2(GpuLib* gpu, GpuKernel kernel, i32x2 num_groups)
 {
-
+	gpuQueueDispatch3(gpu, kernel, i32x3_init2(num_groups, 1));
 }
 
-sfz_extern_c void gpuEnqueueKernel3(GpuLib* gpu, GpuKernel kernel, i32x3 num_groups)
+sfz_extern_c void gpuQueueDispatch3(GpuLib* gpu, GpuKernel kernel, i32x3 num_groups)
 {
+	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
 
+	// Set kernel
+	const GpuKernelInfo* kernel_info = gpu->kernels.get(SfzHandle{ kernel.handle });
+	if (kernel_info == nullptr) {
+		printf("[gpu_lib]: Invalid kernel handle.\n");
+		return;
+	}
+	cmd_list_info.cmd_list->SetPipelineState(kernel_info->pso.Get());
+	cmd_list_info.cmd_list->SetComputeRootSignature(kernel_info->root_sig.Get());
+
+	// Dispatch
+	sfz_assert(0 < num_groups.x && 0 < num_groups.y && 0 < num_groups.z);
+	cmd_list_info.cmd_list->Dispatch(u32(num_groups.x), u32(num_groups.y), u32(num_groups.z));
 }
 
 sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu)
 {
+	// Execute current command list
+	{
+		GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
 
+		// Close command list
+		if (!CHECK_D3D12(cmd_list_info.cmd_list->Close())) {
+			printf("[gpu_lib]: Could not close command list.\n");
+			return;
+		}
+
+		// Execute command list
+		ID3D12CommandList* cmd_lists[1] = {};
+		cmd_lists[0] = cmd_list_info.cmd_list.Get();
+		gpu->cmd_queue->ExecuteCommandLists(1, cmd_lists);
+
+
+		/*gpu->cmd_queue->Signal(
+		CHECK_D3D12 mCommandQueue->Signal(mCommandQueueFence.Get(), mCommandQueueFenceValue);
+		u64 fence_value = mCommandQueueFenceValue++;
+		
+		void waitOnCpuInternal(u64 fenceValue) noexcept
+		{
+		if (!isFenceValueDone(fenceValue)) {
+			CHECK_D3D12 mCommandQueueFence->SetEventOnCompletion(
+				fenceValue, mCommandQueueFenceEvent);
+				// TODO: Don't wait forever
+				::WaitForSingleObject(mCommandQueueFenceEvent, INFINITE);
+			}
+		}
+
+		bool isFenceValueDone(u64 fenceValue) noexcept
+		{
+			return mCommandQueueFence->GetCompletedValue() >= fenceValue;
+		}
+		
+		*/
+	}
+
+	// Switch to next command list
+	{
+		gpu->curr_cmd_list = (gpu->curr_cmd_list + 1) % GPU_NUM_CMD_LISTS;
+		GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
+
+		if (!CHECK_D3D12(cmd_list_info.cmd_allocator->Reset())) {
+			printf("[gpu_lib]: Couldn't reset command allocator\n");
+			return;
+		}
+		if (!CHECK_D3D12(cmd_list_info.cmd_list->Reset(cmd_list_info.cmd_allocator.Get(), nullptr))) {
+			printf("[gpu_lib]: Couldn't reset command list\n");
+			return;
+		}
+
+		/*
+		// Set descriptor heap
+		if (commandListType != D3D12_COMMAND_LIST_TYPE_COPY) {
+			ID3D12DescriptorHeap* heaps[] = { mDescriptorBuffer->descriptorHeap.Get() };
+			commandList->SetDescriptorHeaps(1, heaps);
+		}
+		*/
+	}
 }
 
 sfz_extern_c void gpuFlush(GpuLib* gpu)

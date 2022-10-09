@@ -4,6 +4,13 @@
 
 #include <sfz.h>
 
+// Constants
+// ------------------------------------------------------------------------------------------------
+
+sfz_constant u32 GPU_HEAP_SYSTEM_RESERVED_SIZE = 8 * 1024 * 1024;
+sfz_constant u32 GPU_HEAP_MIN_SIZE = GPU_HEAP_SYSTEM_RESERVED_SIZE;
+sfz_constant u32 GPU_HEAP_MAX_SIZE = U32_MAX;
+
 // Init API
 // ------------------------------------------------------------------------------------------------
 
@@ -90,9 +97,9 @@ sfz_extern_c i32x3 gpuKernelGetGroupDims(const GpuLib* gpu, GpuKernel kernel);
 // Submission API
 // ------------------------------------------------------------------------------------------------
 
-sfz_extern_c void gpuEnqueueKernel1(GpuLib* gpu, GpuKernel kernel, i32 num_groups);
-sfz_extern_c void gpuEnqueueKernel2(GpuLib* gpu, GpuKernel kernel, i32x2 num_groups);
-sfz_extern_c void gpuEnqueueKernel3(GpuLib* gpu, GpuKernel kernel, i32x3 num_groups);
+sfz_extern_c void gpuQueueDispatch1(GpuLib* gpu, GpuKernel kernel, i32 num_groups);
+sfz_extern_c void gpuQueueDispatch2(GpuLib* gpu, GpuKernel kernel, i32x2 num_groups);
+sfz_extern_c void gpuQueueDispatch3(GpuLib* gpu, GpuKernel kernel, i32x3 num_groups);
 
 sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu);
 sfz_extern_c void gpuFlush(GpuLib* gpu);
