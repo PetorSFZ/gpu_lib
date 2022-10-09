@@ -19,9 +19,14 @@ sfz_constant u32 GPU_LAUNCH_PARAMS_MAX_SIZE = sizeof(u32) * 12;
 struct GpuLib;
 
 sfz_struct(GpuLibInitCfg) {
+
 	SfzAllocator* cpu_allocator;
 	u32 gpu_heap_size_bytes;
 	u32 max_num_kernels;
+	
+	void* native_window_handle;
+	bool allow_tearing;
+	
 	bool debug_mode;
 	bool debug_shader_validation;
 };
@@ -32,15 +37,7 @@ sfz_extern_c void gpuLibDestroy(GpuLib* gpu);
 // Memory API
 // ------------------------------------------------------------------------------------------------
 
-sfz_struct(GpuPtr) {
-	u32 offset;
-
-#ifdef __cplusplus
-	constexpr bool operator== (GpuPtr o) const { return offset == o.offset; }
-	constexpr bool operator!= (GpuPtr o) const { return offset != o.offset; }
-#endif
-};
-
+typedef u32 GpuPtr;
 sfz_constant GpuPtr GPU_NULLPTR = {};
 
 sfz_extern_c GpuPtr gpuMalloc(GpuLib* gpu, u32 num_bytes);
@@ -131,6 +128,10 @@ inline void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32 num_groups)
 	return gpuQueueDispatch(gpu, kernel, i32x3_init(num_groups, 1, 1));
 }
 #endif // __cplusplus
+
+sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu, i32x2 window_res);
+sfz_extern_c void gpuQueueSwapchainEnd(GpuLib* gpu);
+sfz_extern_c void gpuSwapchainPresent(GpuLib* gpu, bool vsync);
 
 sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu);
 sfz_extern_c void gpuFlush(GpuLib* gpu);

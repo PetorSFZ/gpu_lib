@@ -98,11 +98,11 @@ static bool checkD3D12(const char* file, i32 line, HRESULT res)
 // String functions
 // ------------------------------------------------------------------------------------------------
 
-static i32 utf8ToWide(wchar_t* wideOut, u32 numWideChars, const char* utf8In)
+/*static i32 utf8ToWide(wchar_t* wideOut, u32 numWideChars, const char* utf8In)
 {
 	const i32 numCharsWritten = MultiByteToWideChar(CP_UTF8, 0, utf8In, -1, wideOut, numWideChars);
 	return numCharsWritten;
-}
+}*/
 
 // Debug messages
 // ------------------------------------------------------------------------------------------------
@@ -159,6 +159,11 @@ sfz_struct(GpuKernelInfo) {
 	u32 launch_params_size;
 };
 
+sfz_struct(GpuSwapchainFB) {
+	ComPtr<ID3D12DescriptorHeap> descriptor_heap_rtv;
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv_descriptor;
+};
+
 sfz_struct(GpuLib) {
 	GpuLibInitCfg cfg;
 
@@ -186,6 +191,10 @@ sfz_struct(GpuLib) {
 
 	// Kernels
 	sfz::Pool<GpuKernelInfo> kernels;
+
+	// Swapchain
+	ComPtr<IDXGISwapChain4> swapchain;
+	GpuSwapchainFB swapchain_fbs[GPU_NUM_CMD_LISTS];
 };
 
 // Init API
@@ -373,6 +382,74 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 		}
 	}
 
+	// If we have a window handle specified create swapchain and such
+	ComPtr<IDXGISwapChain4> swapchain;
+	GpuSwapchainFB swapchain_fbs[GPU_NUM_CMD_LISTS] = {};
+	if (cfg.native_window_handle != nullptr) {
+		const HWND hwnd = static_cast<const HWND>(cfg.native_window_handle);
+
+		// Check if screen-tearing is allowed
+		{
+			BOOL tearing_allowed = FALSE;
+			CHECK_D3D12(dxgi_factory->CheckFeatureSupport(
+				DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing_allowed, sizeof(tearing_allowed)));
+			cfg.allow_tearing = tearing_allowed != FALSE;
+		}
+
+		// Create swap chain
+		{
+			DXGI_SWAP_CHAIN_DESC1 desc = {};
+			// Dummy initial res, will allocate framebuffers for real at first use.
+			desc.Width = 4;
+			desc.Height = 4;
+			desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			desc.Stereo = FALSE;
+			desc.SampleDesc = { 1, 0 }; // No MSAA
+			desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; // DXGI_USAGE_UNORDERED_ACCESS
+			desc.BufferCount = GPU_NUM_CMD_LISTS;
+			desc.Scaling = DXGI_SCALING_STRETCH;
+			desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+			desc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+			desc.Flags = (cfg.allow_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+
+			ComPtr<IDXGISwapChain1> tmp_swapchain;
+			if (!CHECK_D3D12(dxgi_factory->CreateSwapChainForHwnd(
+				cmd_queue.Get(), hwnd, &desc, nullptr, nullptr, &tmp_swapchain))) {
+				printf("[gpu_lib]: Could not create swapchain.");
+				return nullptr;
+			}
+			if (!CHECK_D3D12(tmp_swapchain.As(&swapchain))) {
+				printf("[gpu_lib]: Could not create swapchain.");
+				return nullptr;
+			}
+		}
+
+		// Disable Alt+Enter to fullscreen
+		//
+		// This fixes issues with DXGI_PRESENT_ALLOW_TEARING, which is required for Adaptive Sync
+		// to work correctly with windowed applications. The default Alt+Enter shortcut enters
+		// "true" fullscreen (same as calling SetFullscreenState(TRUE)), which is not what we want
+		// if we only want to support e.g. borderless fullscreen.
+		CHECK_D3D12(dxgi_factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER));
+
+		// Create swapchain descriptor heaps
+		for (u32 i = 0; i < GPU_NUM_CMD_LISTS; i++) {
+			GpuSwapchainFB& fb = swapchain_fbs[i];
+
+			// Create render target descriptor heap
+			D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc = {};
+			rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+			rtv_heap_desc.NumDescriptors = 1;
+			rtv_heap_desc.NodeMask = 0;
+			if (!CHECK_D3D12(device->CreateDescriptorHeap(
+				&rtv_heap_desc, IID_PPV_ARGS(&fb.descriptor_heap_rtv)))) {
+				printf("[gpu_lib]: Could not create swapchain RTV descriptor heap.");
+				return nullptr;
+			}
+			fb.rtv_descriptor = fb.descriptor_heap_rtv->GetCPUDescriptorHandleForHeapStart();
+		}
+	}
+
 	GpuLib* gpu = sfz_new<GpuLib>(cfg.cpu_allocator, sfz_dbg("GpuLib"));
 	*gpu = {};
 	gpu->cfg = cfg;
@@ -396,6 +473,9 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 
 	gpu->kernels.init(cfg.max_num_kernels, cfg.cpu_allocator, sfz_dbg("GpuLib::kernels"));
 
+	gpu->swapchain = swapchain;
+	for (u32 i = 0; i < GPU_NUM_CMD_LISTS; i++) gpu->swapchain_fbs[i] = swapchain_fbs[i];
+
 	return gpu;
 }
 
@@ -418,12 +498,15 @@ sfz_extern_c void gpuLibDestroy(GpuLib* gpu)
 
 sfz_extern_c GpuPtr gpuMalloc(GpuLib* gpu, u32 num_bytes)
 {
+	(void)gpu;
+	(void)num_bytes;
 	return GPU_NULLPTR;
 }
 
 sfz_extern_c void gpuFree(GpuLib* gpu, GpuPtr ptr)
 {
-	
+	(void)gpu;
+	(void)ptr;
 }
 
 // Kernel API
@@ -439,7 +522,7 @@ sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc)
 		// Create source blob
 		// TODO: From file please
 		ComPtr<IDxcBlobEncoding> source_blob;
-		if (!CHECK_D3D12(gpu->dxc_utils->CreateBlob(desc->src, strlen(desc->src), CP_UTF8, &source_blob))) {
+		if (!CHECK_D3D12(gpu->dxc_utils->CreateBlob(desc->src, u32(strlen(desc->src)), CP_UTF8, &source_blob))) {
 			printf("[gpulib]: Failed to create source blob\n");
 			return GPU_NULL_KERNEL;
 		}
@@ -658,7 +741,7 @@ sfz_extern_c void gpuQueueDispatch(
 
 	// Set launch params
 	if (kernel_info->launch_params_size != params_size) {
-		printf("[gpu_lib]: Invalid sizeo of launch parameters, got %u bytes, expected %u bytes.\n",
+		printf("[gpu_lib]: Invalid size of launch parameters, got %u bytes, expected %u bytes.\n",
 			params_size, kernel_info->launch_params_size);
 		return;
 	}
@@ -670,6 +753,122 @@ sfz_extern_c void gpuQueueDispatch(
 	// Dispatch
 	sfz_assert(0 < num_groups.x && 0 < num_groups.y && 0 < num_groups.z);
 	cmd_list_info.cmd_list->Dispatch(u32(num_groups.x), u32(num_groups.y), u32(num_groups.z));
+}
+
+sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu, i32x2 window_res)
+{
+	if (gpu->swapchain == nullptr) return;
+	if (window_res.x <= 0 || window_res.y <= 0) {
+		printf("[gpu_lib]: Invalid window resolution.\n");
+		sfz_assert(false);
+		return;
+	}
+
+	// Grab old swapchain resolution
+	DXGI_SWAP_CHAIN_DESC swapchain_desc = {};
+	CHECK_D3D12(gpu->swapchain->GetDesc(&swapchain_desc));
+	sfz_assert(swapchain_desc.BufferCount == GPU_NUM_CMD_LISTS);
+	const i32x2 old_swapchain_res =
+		i32x2_init(swapchain_desc.BufferDesc.Width, swapchain_desc.BufferDesc.Height);
+	
+	// Resize swapchain if window resolution has changed
+	if (old_swapchain_res != window_res) {
+		printf("[gpu_lib]: Resizing swapchain framebuffers from %ix%i to %ix%i\n",
+			old_swapchain_res.x, old_swapchain_res.y, window_res.x, window_res.y);
+
+		// Flush current work in-progress
+		gpuFlush(gpu);
+
+		// Resize swapchain
+		if (!CHECK_D3D12(gpu->swapchain->ResizeBuffers(
+			GPU_NUM_CMD_LISTS,
+			u32(window_res.x),
+			u32(window_res.y),
+			swapchain_desc.BufferDesc.Format,
+			swapchain_desc.Flags))) {
+			printf("[gpu_lib]: Failed to resize swapchain framebuffers\n");
+			return;
+		}
+
+		// Set RTV descriptors
+		for (u32 i = 0; i < GPU_NUM_CMD_LISTS; i++) {
+			GpuSwapchainFB& fb = gpu->swapchain_fbs[i];
+			ComPtr<ID3D12Resource> render_target;
+			CHECK_D3D12(gpu->swapchain->GetBuffer(i, IID_PPV_ARGS(&render_target)));
+			gpu->device->CreateRenderTargetView(render_target.Get(), nullptr, fb.rtv_descriptor);
+		}
+	}
+
+	// Grab current swapchain render target and descriptor heap
+	const u32 curr_swapchain_fb_idx = gpu->swapchain->GetCurrentBackBufferIndex();
+	sfz_assert(curr_swapchain_fb_idx < GPU_NUM_CMD_LISTS);
+	GpuSwapchainFB& fb = gpu->swapchain_fbs[curr_swapchain_fb_idx];
+	ComPtr<ID3D12Resource> render_target;
+	CHECK_D3D12(gpu->swapchain->GetBuffer(curr_swapchain_fb_idx, IID_PPV_ARGS(&render_target)));
+
+	// Create barrier to transition swapchain render target into RENDER_TARGET state
+	D3D12_RESOURCE_BARRIER rt_barrier = {};
+	rt_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	rt_barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+	rt_barrier.Transition.pResource = render_target.Get();
+	rt_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	rt_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+	rt_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
+	cmd_list_info.cmd_list->ResourceBarrier(1, &rt_barrier);
+
+	// Set viewport
+	D3D12_VIEWPORT viewport = {};
+	viewport.TopLeftX = 0;
+	viewport.TopLeftY = 0;
+	viewport.Width = f32(window_res.x);
+	viewport.Height = f32(window_res.y);
+	viewport.MinDepth = 0.0f;
+	viewport.MaxDepth = 1.0f;
+	cmd_list_info.cmd_list->RSSetViewports(1, &viewport);
+	
+	// Set scissor rect
+	D3D12_RECT scissor_rect = {};
+	scissor_rect.left = 0;
+	scissor_rect.top = 0;
+	scissor_rect.right = LONG_MAX;
+	scissor_rect.bottom = LONG_MAX;
+	cmd_list_info.cmd_list->RSSetScissorRects(1, &scissor_rect);
+
+	// Set swapchain render target
+	cmd_list_info.cmd_list->OMSetRenderTargets(1, &fb.rtv_descriptor, FALSE, nullptr);
+}
+
+sfz_extern_c void gpuQueueSwapchainEnd(GpuLib* gpu)
+{
+	// Grab current swapchain render target and descriptor heap
+	const u32 curr_swapchain_fb_idx = gpu->swapchain->GetCurrentBackBufferIndex();
+	sfz_assert(curr_swapchain_fb_idx < GPU_NUM_CMD_LISTS);
+	GpuSwapchainFB& fb = gpu->swapchain_fbs[curr_swapchain_fb_idx];
+	ComPtr<ID3D12Resource> render_target;
+	CHECK_D3D12(gpu->swapchain->GetBuffer(curr_swapchain_fb_idx, IID_PPV_ARGS(&render_target)));
+
+	// Create barrier to transition swapchain render target into PRESENT state
+	D3D12_RESOURCE_BARRIER rt_barrier = {};
+	rt_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	rt_barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+	rt_barrier.Transition.pResource = render_target.Get();
+	rt_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	rt_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	rt_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
+	cmd_list_info.cmd_list->ResourceBarrier(1, &rt_barrier);
+}
+
+sfz_extern_c void gpuSwapchainPresent(GpuLib* gpu, bool vsync)
+{
+	// Present swapchain's render target
+	const u32 vsync_val = vsync ? 1 : 0; // Can specify 2-4 for vsync:ing on not every frame
+	const u32 flags = gpu->cfg.allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
+	if (!CHECK_D3D12(gpu->swapchain->Present(vsync_val, flags))) {
+		printf("[gpu_lib]: Present failure.\n");
+		return;
+	}
 }
 
 sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu)

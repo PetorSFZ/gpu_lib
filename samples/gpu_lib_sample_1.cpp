@@ -52,6 +52,10 @@ i32 main(i32 argc, char* argv[])
 		.cpu_allocator = &global_cpu_allocator,
 		.gpu_heap_size_bytes = 2u * 1024u * 1024u * 1024u,//U32_MAX,
 		.max_num_kernels = 128,
+		
+		.native_window_handle = window_handle,
+		.allow_tearing = true,
+		
 		.debug_mode = true,
 		.debug_shader_validation = true
 	};
@@ -125,12 +129,16 @@ void CSMain(
 		i32x2 res = i32x2_splat(0);
 		SDL_GL_GetDrawableSize(window, &res.x, &res.y);
 
+		gpuQueueSwapchainBegin(gpu, res);
+
 		struct {
 			i32x4 params;
 		} params;
 		gpuQueueDispatch(gpu, kernel, i32x3_init(1, 1, 1), params);
 
+		gpuQueueSwapchainEnd(gpu);
 		gpuSubmitQueuedWork(gpu);
+		gpuSwapchainPresent(gpu, false);
 	}
 	gpuFlush(gpu);
 
