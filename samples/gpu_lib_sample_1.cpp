@@ -82,7 +82,9 @@ RWByteAddressBuffer gpu_global_heap : register(u0);
 RWTexture2D<f32x4> gpu_rwtex_array[] : register(u1);
 
 cbuffer LaunchParams : register(b0) {
-	i32x4 params;
+	i32x2 res;
+	i32 padding1;
+	i32 padding2;
 }
 
 [numthreads(16, 16, 1)]
@@ -93,8 +95,11 @@ void CSMain(
 	i32x3 dispatch_thread_idx : SV_DispatchThreadID) // Global index of thread
 {
 	const i32x2 idx = dispatch_thread_idx.xy;
+	if (res.x <= idx.x || res.y <= idx.y) return;
+
+	if (idx.x == 0 && idx.y == 0) gpu_global_heap.Store(0, 42);
+
 	RWTexture2D<f32x4> swapchain_rt = gpu_rwtex_array[0];
-	gpu_global_heap.Store(0, params.x);
 	swapchain_rt[idx] = f32x4(0.0, 1.0, 0.0, 1.0);
 }
 
@@ -116,33 +121,35 @@ void CSMain(
 		// loop. "return false;" == continue to next iteration
 		if (![&]() -> bool {
 			SDL_Event event = {};
-			while (SDL_PollEvent(&event) != 0) {
-				switch (event.type) {
-				case SDL_QUIT:
-					running = false;
-					return false;
-				case SDL_KEYUP:
-					if (event.key.keysym.sym == SDLK_ESCAPE) {
+				while (SDL_PollEvent(&event) != 0) {
+					switch (event.type) {
+					case SDL_QUIT:
 						running = false;
-						return false;
+							return false;
+					case SDL_KEYUP:
+						if (event.key.keysym.sym == SDLK_ESCAPE) {
+							running = false;
+								return false;
+						}
+						break;
 					}
-					break;
 				}
-			}
 			return true;
-		}()) continue;
+			}()) continue;
 
-		// Query drawable width and height and update ZeroG context
-		i32x2 res = i32x2_splat(0);
-		SDL_GL_GetDrawableSize(window, &res.x, &res.y);
-
-		gpuQueueSwapchainBegin(gpu, res);
+		gpuQueueSwapchainBegin(gpu);
+		const i32x2 res = gpuSwapchainGetRes(gpu);
+		const i32x2 group_dims = gpuKernelGetGroupDims2(gpu, kernel);
+		const i32x2 num_groups = (res + group_dims - i32x2_splat(1)) / group_dims;
 
 		struct {
-			i32x4 params;
+			i32x2 res;
+			i32 padding1;
+			i32 padding2;
 		} params;
-		gpuQueueDispatch2(gpu, kernel, i32x2_init(1, 1), GPU_LAUNCH_PARAMS(params));
-		//gpuQueueDispatch2(gpu, kernel, i32x2_init(1, 1), GPU_LAUNCH_NO_PARAMS);
+		params.res = res;
+		gpuQueueDispatch2(gpu, kernel, num_groups, GPU_LAUNCH_PARAMS(params));
+		//gpuQueueDispatch2(gpu, kernel, num_groups, GPU_LAUNCH_NO_PARAMS);
 
 		gpuQueueSwapchainEnd(gpu);
 		gpuSubmitQueuedWork(gpu);

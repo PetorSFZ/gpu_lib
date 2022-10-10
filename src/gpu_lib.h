@@ -93,9 +93,23 @@ sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc);
 sfz_extern_c void gpuKernelDestroy(GpuLib* gpu, GpuKernel kernel);
 
 sfz_extern_c i32x3 gpuKernelGetGroupDims(const GpuLib* gpu, GpuKernel kernel);
+inline i32x2 gpuKernelGetGroupDims2(const GpuLib* gpu, GpuKernel kernel)
+{
+	const i32x3 dims = gpuKernelGetGroupDims(gpu, kernel);
+	sfz_assert(dims.z == 1);
+	return i32x2_init(dims.x, dims.y);
+}
+inline i32 gpuKernelGetGroupDims1(const GpuLib* gpu, GpuKernel kernel)
+{
+	const i32x3 dims = gpuKernelGetGroupDims(gpu, kernel);
+	sfz_assert(dims.y == 1 && dims.z == 1);
+	return dims.x;
+}
 
 // Submission API
 // ------------------------------------------------------------------------------------------------
+
+sfz_extern_c i32x2 gpuSwapchainGetRes(GpuLib* gpu);
 
 sfz_extern_c void gpuQueueDispatch(
 	GpuLib* gpu, GpuKernel kernel, i32x3 num_groups, const void* params, u32 params_size);
@@ -117,7 +131,7 @@ template<typename T> const T* gpuCppPointifier(const T& ref) { return &ref; }
 #define GPU_LAUNCH_NO_PARAMS 0, 0
 #endif // __cplusplus
 
-sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu, i32x2 window_res);
+sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu);
 sfz_extern_c void gpuQueueSwapchainEnd(GpuLib* gpu);
 sfz_extern_c void gpuSwapchainPresent(GpuLib* gpu, bool vsync);
 

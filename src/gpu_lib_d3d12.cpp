@@ -203,6 +203,7 @@ sfz_struct(GpuLib) {
 	sfz::Pool<GpuKernelInfo> kernels;
 
 	// Swapchain
+	i32x2 swapchain_res;
 	ComPtr<IDXGISwapChain4> swapchain;
 	GpuSwapchainFB swapchain_fbs[GPU_NUM_CMD_LISTS];
 	ComPtr<ID3D12Resource> swapchain_rt;
@@ -522,6 +523,7 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 
 	gpu->kernels.init(cfg.max_num_kernels, cfg.cpu_allocator, sfz_dbg("GpuLib::kernels"));
 
+	gpu->swapchain_res = i32x2_splat(0);
 	gpu->swapchain = swapchain;
 	for (u32 i = 0; i < GPU_NUM_CMD_LISTS; i++) gpu->swapchain_fbs[i] = swapchain_fbs[i];
 
@@ -780,6 +782,11 @@ sfz_extern_c i32x3 gpuKernelGetGroupDims(const GpuLib* gpu, GpuKernel kernel)
 // Submission API
 // ------------------------------------------------------------------------------------------------
 
+sfz_extern_c i32x2 gpuSwapchainGetRes(GpuLib* gpu)
+{
+	return gpu->swapchain_res;
+}
+
 sfz_extern_c void gpuQueueDispatch(
 	GpuLib* gpu, GpuKernel kernel, i32x3 num_groups, const void* params, u32 params_size)
 {
@@ -817,14 +824,26 @@ sfz_extern_c void gpuQueueDispatch(
 	cmd_list_info.cmd_list->Dispatch(u32(num_groups.x), u32(num_groups.y), u32(num_groups.z));
 }
 
-sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu, i32x2 window_res)
+sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu)
 {
 	if (gpu->swapchain == nullptr) return;
+
+	// Get current window resolution
+	i32x2 window_res = i32x2_splat(0);
+	{
+		const HWND hwnd = static_cast<const HWND>(gpu->cfg.native_window_handle);
+		RECT rect = {};
+		BOOL success = GetClientRect(hwnd, &rect);
+		sfz_assert(success);
+		window_res = i32x2_init(rect.right, rect.bottom);
+	}
+
 	if (window_res.x <= 0 || window_res.y <= 0) {
 		printf("[gpu_lib]: Invalid window resolution.\n");
 		sfz_assert(false);
 		return;
 	}
+	gpu->swapchain_res = window_res;
 
 	// Grab old swapchain resolution
 	DXGI_SWAP_CHAIN_DESC swapchain_desc = {};
