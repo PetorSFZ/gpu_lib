@@ -162,11 +162,6 @@ sfz_struct(GpuKernelInfo) {
 	u32 launch_params_size;
 };
 
-sfz_struct(GpuSwapchainFB) {
-	ComPtr<ID3D12DescriptorHeap> descriptor_heap_rtv;
-	D3D12_CPU_DESCRIPTOR_HANDLE rtv_descriptor;
-};
-
 sfz_struct(GpuLib) {
 	GpuLibInitCfg cfg;
 
@@ -205,7 +200,6 @@ sfz_struct(GpuLib) {
 	// Swapchain
 	i32x2 swapchain_res;
 	ComPtr<IDXGISwapChain4> swapchain;
-	GpuSwapchainFB swapchain_fbs[GPU_NUM_CMD_LISTS];
 	ComPtr<ID3D12Resource> swapchain_rt;
 };
 
@@ -428,7 +422,6 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 
 	// If we have a window handle specified create swapchain and such
 	ComPtr<IDXGISwapChain4> swapchain;
-	GpuSwapchainFB swapchain_fbs[GPU_NUM_CMD_LISTS] = {};
 	if (cfg.native_window_handle != nullptr) {
 		const HWND hwnd = static_cast<const HWND>(cfg.native_window_handle);
 
@@ -475,23 +468,6 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 		// "true" fullscreen (same as calling SetFullscreenState(TRUE)), which is not what we want
 		// if we only want to support e.g. borderless fullscreen.
 		CHECK_D3D12(dxgi_factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER));
-
-		// Create swapchain descriptor heaps
-		for (u32 i = 0; i < GPU_NUM_CMD_LISTS; i++) {
-			GpuSwapchainFB& fb = swapchain_fbs[i];
-
-			// Create render target descriptor heap
-			D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc = {};
-			rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-			rtv_heap_desc.NumDescriptors = 1;
-			rtv_heap_desc.NodeMask = 0;
-			if (!CHECK_D3D12(device->CreateDescriptorHeap(
-				&rtv_heap_desc, IID_PPV_ARGS(&fb.descriptor_heap_rtv)))) {
-				printf("[gpu_lib]: Could not create swapchain RTV descriptor heap.");
-				return nullptr;
-			}
-			fb.rtv_descriptor = fb.descriptor_heap_rtv->GetCPUDescriptorHandleForHeapStart();
-		}
 	}
 
 	GpuLib* gpu = sfz_new<GpuLib>(cfg.cpu_allocator, sfz_dbg("GpuLib"));
@@ -525,7 +501,6 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 
 	gpu->swapchain_res = i32x2_splat(0);
 	gpu->swapchain = swapchain;
-	for (u32 i = 0; i < GPU_NUM_CMD_LISTS; i++) gpu->swapchain_fbs[i] = swapchain_fbs[i];
 
 	return gpu;
 }
@@ -874,14 +849,6 @@ sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu)
 			return;
 		}
 
-		// Set RTV descriptors
-		for (u32 i = 0; i < GPU_NUM_CMD_LISTS; i++) {
-			GpuSwapchainFB& fb = gpu->swapchain_fbs[i];
-			ComPtr<ID3D12Resource> render_target;
-			CHECK_D3D12(gpu->swapchain->GetBuffer(i, IID_PPV_ARGS(&render_target)));
-			gpu->device->CreateRenderTargetView(render_target.Get(), nullptr, fb.rtv_descriptor);
-		}
-
 		// Allocate swapchain RT
 		{
 			D3D12_HEAP_PROPERTIES heap_props = {};
@@ -942,7 +909,6 @@ sfz_extern_c void gpuQueueSwapchainEnd(GpuLib* gpu)
 	// Grab current swapchain render target and descriptor heap
 	const u32 curr_swapchain_fb_idx = gpu->swapchain->GetCurrentBackBufferIndex();
 	sfz_assert(curr_swapchain_fb_idx < GPU_NUM_CMD_LISTS);
-	GpuSwapchainFB& fb = gpu->swapchain_fbs[curr_swapchain_fb_idx];
 	ComPtr<ID3D12Resource> render_target;
 	CHECK_D3D12(gpu->swapchain->GetBuffer(curr_swapchain_fb_idx, IID_PPV_ARGS(&render_target)));
 
