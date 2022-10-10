@@ -100,35 +100,21 @@ sfz_extern_c i32x3 gpuKernelGetGroupDims(const GpuLib* gpu, GpuKernel kernel);
 sfz_extern_c void gpuQueueDispatch(
 	GpuLib* gpu, GpuKernel kernel, i32x3 num_groups, const void* params, u32 params_size);
 
-#ifdef __cplusplus
-template<typename T> 
-void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32x3 num_groups, const T& params)
+inline void gpuQueueDispatch2(
+	GpuLib* gpu, GpuKernel kernel, i32x2 num_groups, const void* params, u32 params_size)
 {
-	return gpuQueueDispatch(gpu, kernel, num_groups, &params, sizeof(T));
+	gpuQueueDispatch(gpu, kernel, i32x3_init2(num_groups, 1), params, params_size);
 }
-template<typename T>
-void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32x2 num_groups, const T& params)
+inline void gpuQueueDispatch1(
+	GpuLib* gpu, GpuKernel kernel, i32 num_groups, const void* params, u32 params_size)
 {
-	return gpuQueueDispatch(gpu, kernel, i32x3_init2(num_groups, 1), &params, sizeof(T));
-}
-template<typename T>
-void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32 num_groups, const T& params)
-{
-	return gpuQueueDispatch(gpu, kernel, i32x3_init(num_groups, 1, 1), &params, sizeof(T));
+	gpuQueueDispatch(gpu, kernel, i32x3_init(num_groups, 1, 1), params, params_size);
 }
 
-inline void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32x3 num_groups)
-{
-	return gpuQueueDispatch(gpu, kernel, num_groups, nullptr, 0);
-}
-inline void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32x2 num_groups)
-{
-	return gpuQueueDispatch(gpu, kernel, i32x3_init2(num_groups, 1));
-}
-inline void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32 num_groups)
-{
-	return gpuQueueDispatch(gpu, kernel, i32x3_init(num_groups, 1, 1));
-}
+#ifdef __cplusplus
+template<typename T> const T* gpuCppPointifier(const T& ref) { return &ref; }
+#define GPU_LAUNCH_PARAMS(expr) gpuCppPointifier((expr)), sizeof((expr))
+#define GPU_LAUNCH_NO_PARAMS 0, 0
 #endif // __cplusplus
 
 sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu, i32x2 window_res);

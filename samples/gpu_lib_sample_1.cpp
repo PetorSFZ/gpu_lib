@@ -141,7 +141,8 @@ void CSMain(
 		struct {
 			i32x4 params;
 		} params;
-		gpuQueueDispatch(gpu, kernel, i32x3_init(1, 1, 1), params);
+		gpuQueueDispatch2(gpu, kernel, i32x2_init(1, 1), GPU_LAUNCH_PARAMS(params));
+		//gpuQueueDispatch2(gpu, kernel, i32x2_init(1, 1), GPU_LAUNCH_NO_PARAMS);
 
 		gpuQueueSwapchainEnd(gpu);
 		gpuSubmitQueuedWork(gpu);
