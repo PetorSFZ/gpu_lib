@@ -144,7 +144,10 @@ static void logDebugMessages(ID3D12InfoQueue* info_queue)
 sfz_constant u32 GPU_NUM_CMD_LISTS = 3;
 
 sfz_constant u32 GPU_ROOT_PARAM_GLOBAL_HEAP_IDX = 0;
-sfz_constant u32 GPU_ROOT_PARAM_LAUNCH_PARAMS_IDX = 1;
+sfz_constant u32 GPU_ROOT_PARAM_RW_TEX_ARRAY_IDX = 1;
+sfz_constant u32 GPU_ROOT_PARAM_LAUNCH_PARAMS_IDX = 2;
+
+sfz_constant u32 RWTEX_ARRAY_SWAPCHAIN_RT_IDX = 0;
 
 sfz_struct(GpuCmdListInfo) {
 	ComPtr<ID3D12GraphicsCommandList> cmd_list;
@@ -175,6 +178,13 @@ sfz_struct(GpuLib) {
 	// GPU Heap
 	ComPtr<ID3D12Resource> gpu_heap;
 
+	// RWTex descriptor heap
+	ComPtr<ID3D12DescriptorHeap> tex_descriptor_heap;
+	u32 num_tex_descriptors;
+	u32 tex_descriptor_size;
+	D3D12_CPU_DESCRIPTOR_HANDLE tex_descriptor_heap_start_cpu;
+	D3D12_GPU_DESCRIPTOR_HANDLE tex_descriptor_heap_start_gpu;
+
 	// Commands
 	ComPtr<ID3D12CommandQueue> cmd_queue;
 	ComPtr<ID3D12Fence> cmd_queue_fence;
@@ -195,6 +205,7 @@ sfz_struct(GpuLib) {
 	// Swapchain
 	ComPtr<IDXGISwapChain4> swapchain;
 	GpuSwapchainFB swapchain_fbs[GPU_NUM_CMD_LISTS];
+	ComPtr<ID3D12Resource> swapchain_rt;
 };
 
 // Init API
@@ -205,6 +216,7 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 	// Copy config so that we can make changes to it before finally storing it in the context
 	GpuLibInitCfg cfg = *cfgIn;
 	cfg.gpu_heap_size_bytes = u32_clamp(cfg.gpu_heap_size_bytes, GPU_HEAP_MIN_SIZE, GPU_HEAP_MAX_SIZE);
+	cfg.max_num_textures_per_type = u32_clamp(cfg.max_num_textures_per_type, GPU_TEXTURES_MIN_NUM, GPU_TEXTURES_MAX_NUM);
 
 	// Enable debug layers in debug mode
 	if (cfg.debug_mode) {
@@ -305,6 +317,31 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 		}
 	}
 
+	// Create tex descriptor heap
+	ComPtr<ID3D12DescriptorHeap> tex_descriptor_heap;
+	u32 num_tex_descriptors = 0;
+	u32 tex_descriptor_size = 0;
+	D3D12_CPU_DESCRIPTOR_HANDLE tex_descriptor_heap_start_cpu = {};
+	D3D12_GPU_DESCRIPTOR_HANDLE tex_descriptor_heap_start_gpu = {};
+	{
+		num_tex_descriptors = cfg.max_num_textures_per_type;
+		D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+		heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+		heap_desc.NumDescriptors = num_tex_descriptors;
+		heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+		heap_desc.NodeMask = 0;
+
+		if (!CHECK_D3D12(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&tex_descriptor_heap)))) {
+			printf("[gpu_lib]: Could not allocate %u descriptors for texture arrays, exiting.\n",
+				num_tex_descriptors);
+			return nullptr;
+		}
+
+		tex_descriptor_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+		tex_descriptor_heap_start_cpu = tex_descriptor_heap->GetCPUDescriptorHandleForHeapStart();
+		tex_descriptor_heap_start_gpu = tex_descriptor_heap->GetGPUDescriptorHandleForHeapStart();
+	}
+
 	// Create command queue
 	ComPtr<ID3D12CommandQueue> cmd_queue;
 	ComPtr<ID3D12Fence> cmd_queue_fence;
@@ -356,6 +393,12 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 				printf("[gpu_lib]: Could not close command list after creation.\n");
 				return nullptr;
 			}
+		}
+
+		// Set texture descriptor heap for initial command list
+		if (i == 0) {
+			ID3D12DescriptorHeap* heaps[] = { tex_descriptor_heap.Get() };
+			info.cmd_list->SetDescriptorHeaps(1, heaps);
 		}
 
 		info.fence_value = 0;
@@ -459,6 +502,12 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 	gpu->info_queue = info_queue;
 
 	gpu->gpu_heap = gpu_heap;
+
+	gpu->tex_descriptor_heap = tex_descriptor_heap;
+	gpu->num_tex_descriptors = num_tex_descriptors;
+	gpu->tex_descriptor_size = tex_descriptor_size;
+	gpu->tex_descriptor_heap_start_cpu = tex_descriptor_heap_start_cpu;
+	gpu->tex_descriptor_heap_start_gpu = tex_descriptor_heap_start_gpu;
 
 	gpu->cmd_queue = cmd_queue;
 	gpu->cmd_queue_fence = cmd_queue_fence;
@@ -618,7 +667,7 @@ sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc)
 	// Create root signature
 	ComPtr<ID3D12RootSignature> root_sig;
 	{
-		constexpr u32 MAX_NUM_ROOT_PARAMS = 2;
+		constexpr u32 MAX_NUM_ROOT_PARAMS = 3;
 		const u32 num_root_params =
 			launch_params_size != 0 ? MAX_NUM_ROOT_PARAMS : (MAX_NUM_ROOT_PARAMS - 1);
 		D3D12_ROOT_PARAMETER1 root_params[MAX_NUM_ROOT_PARAMS] = {};
@@ -629,6 +678,17 @@ sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc)
 		// Note: UAV is written to during command list execution, thus it MUST be volatile.
 		root_params[GPU_ROOT_PARAM_GLOBAL_HEAP_IDX].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
 		root_params[GPU_ROOT_PARAM_GLOBAL_HEAP_IDX].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+		D3D12_DESCRIPTOR_RANGE1 desc_range = {};
+		desc_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+		desc_range.NumDescriptors = UINT_MAX; // Unbounded
+		desc_range.BaseShaderRegister = 1;
+		desc_range.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+		desc_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+		root_params[GPU_ROOT_PARAM_RW_TEX_ARRAY_IDX].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		root_params[GPU_ROOT_PARAM_RW_TEX_ARRAY_IDX].DescriptorTable.NumDescriptorRanges = 1;
+		root_params[GPU_ROOT_PARAM_RW_TEX_ARRAY_IDX].DescriptorTable.pDescriptorRanges = &desc_range;
+		root_params[GPU_ROOT_PARAM_RW_TEX_ARRAY_IDX].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
 		if (launch_params_size != 0) {
 			root_params[GPU_ROOT_PARAM_LAUNCH_PARAMS_IDX].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -738,6 +798,8 @@ sfz_extern_c void gpuQueueDispatch(
 	// TODO: This could probably be done only once somehow
 	cmd_list_info.cmd_list->SetComputeRootUnorderedAccessView(
 		GPU_ROOT_PARAM_GLOBAL_HEAP_IDX, gpu->gpu_heap->GetGPUVirtualAddress());
+	cmd_list_info.cmd_list->SetComputeRootDescriptorTable(
+		GPU_ROOT_PARAM_RW_TEX_ARRAY_IDX, gpu->tex_descriptor_heap_start_gpu);
 
 	// Set launch params
 	if (kernel_info->launch_params_size != params_size) {
@@ -755,7 +817,7 @@ sfz_extern_c void gpuQueueDispatch(
 	cmd_list_info.cmd_list->Dispatch(u32(num_groups.x), u32(num_groups.y), u32(num_groups.z));
 }
 
-sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu, i32x2 window_res, f32x4 clear_color)
+sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu, i32x2 window_res)
 {
 	if (gpu->swapchain == nullptr) return;
 	if (window_res.x <= 0 || window_res.y <= 0) {
@@ -779,6 +841,9 @@ sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu, i32x2 window_res, f32x4 cl
 		// Flush current work in-progress
 		gpuFlush(gpu);
 
+		// Release old swapchain RT
+		gpu->swapchain_rt.Reset();
+
 		// Resize swapchain
 		if (!CHECK_D3D12(gpu->swapchain->ResizeBuffers(
 			GPU_NUM_CMD_LISTS,
@@ -797,53 +862,64 @@ sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu, i32x2 window_res, f32x4 cl
 			CHECK_D3D12(gpu->swapchain->GetBuffer(i, IID_PPV_ARGS(&render_target)));
 			gpu->device->CreateRenderTargetView(render_target.Get(), nullptr, fb.rtv_descriptor);
 		}
+
+		// Allocate swapchain RT
+		{
+			D3D12_HEAP_PROPERTIES heap_props = {};
+			heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+			heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+			heap_props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+			heap_props.CreationNodeMask = 0;
+			heap_props.VisibleNodeMask = 0;
+
+			D3D12_RESOURCE_DESC desc = {};
+			desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			desc.Alignment = 0;
+			desc.Width = u32(window_res.x);
+			desc.Height = u32(window_res.y);
+			desc.DepthOrArraySize = 1;
+			desc.MipLevels = 1;
+			desc.Format = swapchain_desc.BufferDesc.Format;
+			desc.SampleDesc = { 1, 0 };
+			desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+			desc.Flags =
+				D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+				D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+			const bool rt_success = CHECK_D3D12(gpu->device->CreateCommittedResource(
+				&heap_props,
+				D3D12_HEAP_FLAG_CREATE_NOT_ZEROED,
+				&desc,
+				D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+				nullptr,
+				IID_PPV_ARGS(&gpu->swapchain_rt)));
+			if (!rt_success) {
+				printf("[gpu_lib]: Could not allocate swapchain render target of size %ix%i.\n",
+					window_res.x, window_res.y);
+				return;
+			}
+		}
+
+		// Set swapchain RT descriptor in tex descriptor heap
+		{
+			D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+			uav_desc.Format = swapchain_desc.BufferDesc.Format;
+			uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+			uav_desc.Texture2D.MipSlice = 0;
+			uav_desc.Texture2D.PlaneSlice = 0;
+
+			D3D12_CPU_DESCRIPTOR_HANDLE cpu_descriptor = {};
+			cpu_descriptor.ptr =
+				gpu->tex_descriptor_heap_start_cpu.ptr + gpu->tex_descriptor_size * RWTEX_ARRAY_SWAPCHAIN_RT_IDX;
+			gpu->device->CreateUnorderedAccessView(gpu->swapchain_rt.Get(), nullptr, &uav_desc, cpu_descriptor);
+		}
 	}
-
-	// Grab current swapchain render target and descriptor heap
-	const u32 curr_swapchain_fb_idx = gpu->swapchain->GetCurrentBackBufferIndex();
-	sfz_assert(curr_swapchain_fb_idx < GPU_NUM_CMD_LISTS);
-	GpuSwapchainFB& fb = gpu->swapchain_fbs[curr_swapchain_fb_idx];
-	ComPtr<ID3D12Resource> render_target;
-	CHECK_D3D12(gpu->swapchain->GetBuffer(curr_swapchain_fb_idx, IID_PPV_ARGS(&render_target)));
-
-	// Create barrier to transition swapchain render target into RENDER_TARGET state
-	D3D12_RESOURCE_BARRIER rt_barrier = {};
-	rt_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	rt_barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-	rt_barrier.Transition.pResource = render_target.Get();
-	rt_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	rt_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-	rt_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
-	cmd_list_info.cmd_list->ResourceBarrier(1, &rt_barrier);
-
-	// Set viewport
-	D3D12_VIEWPORT viewport = {};
-	viewport.TopLeftX = 0;
-	viewport.TopLeftY = 0;
-	viewport.Width = f32(window_res.x);
-	viewport.Height = f32(window_res.y);
-	viewport.MinDepth = 0.0f;
-	viewport.MaxDepth = 1.0f;
-	cmd_list_info.cmd_list->RSSetViewports(1, &viewport);
-	
-	// Set scissor rect
-	D3D12_RECT scissor_rect = {};
-	scissor_rect.left = 0;
-	scissor_rect.top = 0;
-	scissor_rect.right = LONG_MAX;
-	scissor_rect.bottom = LONG_MAX;
-	cmd_list_info.cmd_list->RSSetScissorRects(1, &scissor_rect);
-
-	// Set swapchain render target
-	cmd_list_info.cmd_list->OMSetRenderTargets(1, &fb.rtv_descriptor, FALSE, nullptr);
-
-	// Clear render target
-	cmd_list_info.cmd_list->ClearRenderTargetView(fb.rtv_descriptor, &clear_color.x, 0, nullptr);
 }
 
 sfz_extern_c void gpuQueueSwapchainEnd(GpuLib* gpu)
 {
+	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
+
 	// Grab current swapchain render target and descriptor heap
 	const u32 curr_swapchain_fb_idx = gpu->swapchain->GetCurrentBackBufferIndex();
 	sfz_assert(curr_swapchain_fb_idx < GPU_NUM_CMD_LISTS);
@@ -851,16 +927,50 @@ sfz_extern_c void gpuQueueSwapchainEnd(GpuLib* gpu)
 	ComPtr<ID3D12Resource> render_target;
 	CHECK_D3D12(gpu->swapchain->GetBuffer(curr_swapchain_fb_idx, IID_PPV_ARGS(&render_target)));
 
-	// Create barrier to transition swapchain render target into PRESENT state
-	D3D12_RESOURCE_BARRIER rt_barrier = {};
-	rt_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	rt_barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-	rt_barrier.Transition.pResource = render_target.Get();
-	rt_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	rt_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-	rt_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
-	cmd_list_info.cmd_list->ResourceBarrier(1, &rt_barrier);
+	// Barriers to transition swapchain rwtex to COPY_SOURCE and swapchain backing to COPY_DEST.
+	{
+		D3D12_RESOURCE_BARRIER barriers[2] = {};
+
+		barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		barriers[0].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+		barriers[0].Transition.pResource = gpu->swapchain_rt.Get();
+		barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+		barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+
+		barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		barriers[1].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+		barriers[1].Transition.pResource = render_target.Get();
+		barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+		barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+
+		cmd_list_info.cmd_list->ResourceBarrier(2, barriers);
+	}
+
+	// Copy contents of swapchain rt to actual backbuffer
+	cmd_list_info.cmd_list->CopyResource(render_target.Get(), gpu->swapchain_rt.Get());
+
+	// Barriers to transition swapchain rwtex to UNORDERED_ACCESS and swapchain backing to PRESENT.
+	{
+		D3D12_RESOURCE_BARRIER barriers[2] = {};
+
+		barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		barriers[0].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+		barriers[0].Transition.pResource = gpu->swapchain_rt.Get();
+		barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+		barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+
+		barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		barriers[1].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+		barriers[1].Transition.pResource = render_target.Get();
+		barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+		barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+
+		cmd_list_info.cmd_list->ResourceBarrier(2, barriers);
+	}
 }
 
 sfz_extern_c void gpuSwapchainPresent(GpuLib* gpu, bool vsync)
@@ -923,11 +1033,9 @@ sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu)
 			return;
 		}
 
-		/*
-		// Set descriptor heap
-		ID3D12DescriptorHeap* heaps[] = { mDescriptorBuffer->descriptorHeap.Get() };
-		commandList->SetDescriptorHeaps(1, heaps);
-		*/
+		// Set texture descriptor heap
+		ID3D12DescriptorHeap* heaps[] = { gpu->tex_descriptor_heap.Get() };
+		cmd_list_info.cmd_list->SetDescriptorHeaps(1, heaps);
 	}
 }
 

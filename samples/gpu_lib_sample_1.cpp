@@ -50,7 +50,8 @@ i32 main(i32 argc, char* argv[])
 	// Initialize gpu_lib
 	const GpuLibInitCfg gpu_init_cfg = GpuLibInitCfg{
 		.cpu_allocator = &global_cpu_allocator,
-		.gpu_heap_size_bytes = 2u * 1024u * 1024u * 1024u,//U32_MAX,
+		.gpu_heap_size_bytes = 1u * 1024u * 1024u * 1024u,//U32_MAX,
+		.max_num_textures_per_type = 1024,
 		.max_num_kernels = 128,
 		
 		.native_window_handle = window_handle,
@@ -72,10 +73,13 @@ i32 main(i32 argc, char* argv[])
 R"(
 
 typedef int i32;
+typedef int2 i32x2;
 typedef int3 i32x3;
 typedef int4 i32x4;
+typedef float4 f32x4;
 
 RWByteAddressBuffer gpu_global_heap : register(u0);
+RWTexture2D<f32x4> gpu_rwtex_array[] : register(u1);
 
 cbuffer LaunchParams : register(b0) {
 	i32x4 params;
@@ -88,7 +92,10 @@ void CSMain(
 	i32x3 group_thread_idx : SV_GroupThreadID, // Index of thread within group
 	i32x3 dispatch_thread_idx : SV_DispatchThreadID) // Global index of thread
 {
+	const i32x2 idx = dispatch_thread_idx.xy;
+	RWTexture2D<f32x4> swapchain_rt = gpu_rwtex_array[0];
 	gpu_global_heap.Store(0, params.x);
+	swapchain_rt[idx] = f32x4(0.0, 1.0, 0.0, 1.0);
 }
 
 )";
@@ -100,8 +107,6 @@ void CSMain(
 	sfz_defer[=]() {
 		gpuKernelDestroy(gpu, kernel);
 	};
-
-	f32 clear_value = 0.0f;
 
 	// Run our main loop
 	bool running = true;
@@ -131,9 +136,7 @@ void CSMain(
 		i32x2 res = i32x2_splat(0);
 		SDL_GL_GetDrawableSize(window, &res.x, &res.y);
 
-		clear_value += 0.01f;
-		if (1.0f < clear_value) clear_value = 0.0f;
-		gpuQueueSwapchainBegin(gpu, res, f32x4_init(clear_value, 0.0f, 0.0f, 0.0f));
+		gpuQueueSwapchainBegin(gpu, res);
 
 		struct {
 			i32x4 params;

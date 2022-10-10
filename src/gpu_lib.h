@@ -10,7 +10,8 @@
 sfz_constant u32 GPU_HEAP_SYSTEM_RESERVED_SIZE = 8 * 1024 * 1024;
 sfz_constant u32 GPU_HEAP_MIN_SIZE = GPU_HEAP_SYSTEM_RESERVED_SIZE;
 sfz_constant u32 GPU_HEAP_MAX_SIZE = U32_MAX;
-
+sfz_constant u32 GPU_TEXTURES_MIN_NUM = 1;
+sfz_constant u32 GPU_TEXTURES_MAX_NUM = 16384;
 sfz_constant u32 GPU_LAUNCH_PARAMS_MAX_SIZE = sizeof(u32) * 12;
 
 // Init API
@@ -22,6 +23,7 @@ sfz_struct(GpuLibInitCfg) {
 
 	SfzAllocator* cpu_allocator;
 	u32 gpu_heap_size_bytes;
+	u32 max_num_textures_per_type;
 	u32 max_num_kernels;
 	
 	void* native_window_handle;
@@ -129,7 +131,7 @@ inline void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32 num_groups)
 }
 #endif // __cplusplus
 
-sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu, i32x2 window_res, f32x4 clear_color);
+sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu, i32x2 window_res);
 sfz_extern_c void gpuQueueSwapchainEnd(GpuLib* gpu);
 sfz_extern_c void gpuSwapchainPresent(GpuLib* gpu, bool vsync);
 
