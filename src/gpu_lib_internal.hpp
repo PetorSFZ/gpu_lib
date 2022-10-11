@@ -7,6 +7,7 @@
 #include <stdio.h>
 
 #include <sfz_cpp.hpp>
+#include <sfz_defer.hpp>
 #include <skipifzero_pool.hpp>
 
 // Windows.h
@@ -158,10 +159,110 @@ inline bool checkD3D12(const char* file, i32 line, HRESULT res)
 // String functions
 // ------------------------------------------------------------------------------------------------
 
-/*inline i32 utf8ToWide(wchar_t* wideOut, u32 numWideChars, const char* utf8In)
+inline i32 utf8ToWide(wchar_t* wide_out, u32 num_wide_chars, const char* utf8_in)
 {
-	const i32 numCharsWritten = MultiByteToWideChar(CP_UTF8, 0, utf8In, -1, wideOut, numWideChars);
-	return numCharsWritten;
-}*/
+	const i32 num_chars_written = MultiByteToWideChar(CP_UTF8, 0, utf8_in, -1, wide_out, num_wide_chars);
+	return num_chars_written;
+}
+
+constexpr u32 WIDE_STR_MAX = 320;
+
+sfz_struct(WideStr) {
+	wchar_t str[WIDE_STR_MAX];
+};
+
+inline WideStr expandUtf8(const char* utf8)
+{
+	WideStr wide = {};
+	const i32 num_wide_chars = utf8ToWide(wide.str, WIDE_STR_MAX, utf8);
+	(void)num_wide_chars;
+	return wide;
+}
+
+// IO functions
+// ------------------------------------------------------------------------------------------------
+
+inline WideStr getLastErrorStr()
+{
+	WideStr err_wide = {};
+	FormatMessageW(
+		FORMAT_MESSAGE_FROM_SYSTEM,
+		nullptr,
+		GetLastError(),
+		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), err_wide.str, WIDE_STR_MAX, nullptr);
+	return err_wide;
+}
+
+sfz_struct(FileMapData) {
+	void* ptr;
+	HANDLE h_file;
+	HANDLE h_map;
+	u64 size_bytes;
+};
+
+inline FileMapData fileMap(const char* path, bool read_only)
+{
+	FileMapData map_data = {};
+	const WideStr path_w = expandUtf8(path);
+
+	// Open file
+	const DWORD fileAccess = GENERIC_READ | (read_only ? 0 : GENERIC_WRITE);
+	const DWORD shareMode = FILE_SHARE_READ; // Other processes shouldn't write to our file
+	const DWORD flagsAndAttribs = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN;
+	map_data.h_file = CreateFileW(
+		path_w.str, fileAccess, shareMode, nullptr, OPEN_EXISTING, flagsAndAttribs, nullptr);
+	if (map_data.h_file == INVALID_HANDLE_VALUE) {
+		WideStr errWide = getLastErrorStr();
+		printf("Failed to open file (\"%s\"), reason: %S\n", path, errWide.str);
+		return FileMapData{};
+	}
+
+	// Get file info
+	BY_HANDLE_FILE_INFORMATION fileInfo = {};
+	const BOOL fileInfoRes = GetFileInformationByHandle(map_data.h_file, &fileInfo);
+	if (!fileInfoRes) {
+		WideStr errWide = getLastErrorStr();
+		printf("Failed to get file info for (\"%s\"), reason: %S\n", path, errWide.str);
+		CloseHandle(map_data.h_file);
+		return FileMapData{};
+	}
+	map_data.size_bytes =
+		(u64(fileInfo.nFileSizeHigh) * u64(MAXDWORD + 1)) + u64(fileInfo.nFileSizeLow);
+
+	// Create file mapping object
+	map_data.h_map = CreateFileMappingA(
+		map_data.h_file, nullptr, read_only ? PAGE_READONLY : PAGE_READWRITE, 0, 0, nullptr);
+	if (map_data.h_map == INVALID_HANDLE_VALUE) {
+		WideStr errWide = getLastErrorStr();
+		printf("Failed to create file mapping object for (\"%s\"), reason: %S\n", path, errWide.str);
+		CloseHandle(map_data.h_file);
+		return FileMapData{};
+	}
+
+	// Map file
+	map_data.ptr = MapViewOfFile(map_data.h_map, read_only ? FILE_MAP_READ : FILE_MAP_ALL_ACCESS, 0, 0, 0);
+	if (map_data.ptr == nullptr) {
+		WideStr errWide = getLastErrorStr();
+		printf("Failed to map (\"%s\"), reason: %S\n", path, errWide.str);
+		CloseHandle(map_data.h_map);
+		CloseHandle(map_data.h_file);
+		return FileMapData{};
+	}
+
+	return map_data;
+}
+
+inline void fileUnmap(FileMapData map_data)
+{
+	if (map_data.ptr == nullptr) return;
+	if (!CloseHandle(map_data.h_map)) {
+		WideStr errWide = getLastErrorStr();
+		printf("Failed to CloseHandle(), reason: %S\n", errWide.str);
+	}
+	if (!CloseHandle(map_data.h_file)) {
+		WideStr errWide = getLastErrorStr();
+		printf("Failed to CloseHandle(), reason: %S\n", errWide.str);
+	}
+}
 
 #endif // GPU_LIB_INTERNAL_HPP

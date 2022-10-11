@@ -379,15 +379,24 @@ sfz_extern_c void gpuFree(GpuLib* gpu, GpuPtr ptr)
 
 sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc)
 {
+	// Map shader file
+	FileMapData src_map = fileMap(desc->path, true);
+	if (src_map.ptr == nullptr) {
+		printf("[gpulib]: Failed to map kernel source file \"%s\".\n", desc->path);
+		return GPU_NULL_KERNEL;
+	}
+	const char* const src = static_cast<const char*>(src_map.ptr);
+	const u32 src_size = u32(src_map.size_bytes);
+	sfz_defer[=]() { fileUnmap(src_map); };
+
 	// Compile shader
 	ComPtr<IDxcBlob> dxil_blob;
 	i32x3 group_dims = i32x3_splat(0);
 	u32 launch_params_size = 0;
 	{
 		// Create source blob
-		// TODO: From file please
 		ComPtr<IDxcBlobEncoding> source_blob;
-		if (!CHECK_D3D12(gpu->dxc_utils->CreateBlob(desc->src, u32(strlen(desc->src)), CP_UTF8, &source_blob))) {
+		if (!CHECK_D3D12(gpu->dxc_utils->CreateBlob(src, src_size, CP_UTF8, &source_blob))) {
 			printf("[gpulib]: Failed to create source blob\n");
 			return GPU_NULL_KERNEL;
 		}
@@ -396,12 +405,18 @@ sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc)
 		src_buffer.Size = source_blob->GetBufferSize();
 		src_buffer.Encoding = 0;
 
+		// Defines
+		const u32 num_defines = u32_min(desc->num_defines, GPU_KERNEL_MAX_NUM_DEFINES);
+		wchar_t defines_wide[GPU_KERNEL_DEFINE_MAX_LEN][GPU_KERNEL_MAX_NUM_DEFINES] = {};
+		for (u32 i = 0; i < num_defines; i++) {
+			utf8ToWide(defines_wide[i], GPU_KERNEL_DEFINE_MAX_LEN, desc->defines[i]);
+		}
+
 		// Compiler arguments
-		/*constexpr u32 ENTRY_MAX_LEN = 32;
-		wchar_t entry_wide[ENTRY_MAX_LEN] = {};
-		utf8ToWide(entry_wide, ENTRY_MAX_LEN, desc->entry);*/
-		constexpr u32 NUM_ARGS = 11;
-		LPCWSTR args[NUM_ARGS] = {
+		constexpr u32 NUM_ARGS_BASE = 11;
+		constexpr u32 MAX_NUM_ARGS = NUM_ARGS_BASE + GPU_KERNEL_MAX_NUM_DEFINES;
+		const u32 num_args = NUM_ARGS_BASE + num_defines;
+		LPCWSTR args[MAX_NUM_ARGS] = {
 			L"-E",
 			L"CSMain",
 			L"-T",
@@ -414,11 +429,14 @@ sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc)
 			DXC_ARG_PACK_MATRIX_ROW_MAJOR,
 			L"-DGPU_LIB_HLSL"
 		};
+		for (u32 i = 0; i < num_defines; i++) {
+			args[NUM_ARGS_BASE + i] = defines_wide[i];
+		}
 
 		// Compile shader
 		ComPtr<IDxcResult> compile_res;
 		CHECK_D3D12(gpu->dxc_compiler->Compile(
-			&src_buffer, args, NUM_ARGS, gpu->dxc_include_handler.Get(), IID_PPV_ARGS(&compile_res)));
+			&src_buffer, args, num_args, gpu->dxc_include_handler.Get(), IID_PPV_ARGS(&compile_res)));
 		{
 			ComPtr<IDxcBlobUtf8> error_msgs;
 			CHECK_D3D12(compile_res->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&error_msgs), nullptr));

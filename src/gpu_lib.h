@@ -13,6 +13,8 @@ sfz_constant u32 GPU_HEAP_MAX_SIZE = U32_MAX;
 sfz_constant u32 GPU_TEXTURES_MIN_NUM = 1;
 sfz_constant u32 GPU_TEXTURES_MAX_NUM = 16384;
 sfz_constant u32 GPU_LAUNCH_PARAMS_MAX_SIZE = sizeof(u32) * 12;
+sfz_constant u32 GPU_KERNEL_MAX_NUM_DEFINES = 8;
+sfz_constant u32 GPU_KERNEL_DEFINE_MAX_LEN = 48;
 
 // Init API
 // ------------------------------------------------------------------------------------------------
@@ -84,9 +86,9 @@ sfz_constant GpuKernel GPU_NULL_KERNEL = {};
 
 sfz_struct(GpuKernelDesc) {
 	const char* name;
-	const char* src;
-	//u32 num_defines;
-	//const char* const* defines;
+	const char* path;
+	u32 num_defines;
+	const char* const* defines;
 };
 
 sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc);
