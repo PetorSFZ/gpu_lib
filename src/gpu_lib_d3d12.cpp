@@ -379,15 +379,28 @@ sfz_extern_c void gpuFree(GpuLib* gpu, GpuPtr ptr)
 
 sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc)
 {
-	// Map shader file
-	FileMapData src_map = fileMap(desc->path, true);
-	if (src_map.ptr == nullptr) {
-		printf("[gpulib]: Failed to map kernel source file \"%s\".\n", desc->path);
-		return GPU_NULL_KERNEL;
+	// Read shader file from disk
+	u32 src_size = 0;
+	char* src = nullptr;
+	{
+		// Map shader file
+		FileMapData src_map = fileMap(desc->path, true);
+		if (src_map.ptr == nullptr) {
+			printf("[gpulib]: Failed to map kernel source file \"%s\".\n", desc->path);
+			return GPU_NULL_KERNEL;
+		}
+		sfz_defer[=]() { fileUnmap(src_map); };
+
+		// Allocate memory for src + prolog
+		src_size = u32(src_map.size_bytes + GPU_KERNEL_PROLOG_SIZE);
+		src = static_cast<char*>(gpu->cfg.cpu_allocator->alloc(sfz_dbg(""), src_size + 1));
+		
+		// Copy prolog and then src file into buffer
+		memcpy(src, GPU_KERNEL_PROLOG, GPU_KERNEL_PROLOG_SIZE);
+		memcpy(src + GPU_KERNEL_PROLOG_SIZE, src_map.ptr, src_map.size_bytes);
+		src[src_size] = '\0'; // Guarantee null-termination, safe because we allocated 1 byte extra.
 	}
-	const char* const src = static_cast<const char*>(src_map.ptr);
-	const u32 src_size = u32(src_map.size_bytes);
-	sfz_defer[=]() { fileUnmap(src_map); };
+	sfz_defer[=]() { gpu->cfg.cpu_allocator->dealloc(src); };
 
 	// Compile shader
 	ComPtr<IDxcBlob> dxil_blob;
@@ -407,9 +420,12 @@ sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc)
 
 		// Defines
 		const u32 num_defines = u32_min(desc->num_defines, GPU_KERNEL_MAX_NUM_DEFINES);
-		wchar_t defines_wide[GPU_KERNEL_DEFINE_MAX_LEN][GPU_KERNEL_MAX_NUM_DEFINES] = {};
+		wchar_t defines_wide[GPU_KERNEL_DEFINE_MAX_LEN + 3][GPU_KERNEL_MAX_NUM_DEFINES] = {};
 		for (u32 i = 0; i < num_defines; i++) {
-			utf8ToWide(defines_wide[i], GPU_KERNEL_DEFINE_MAX_LEN, desc->defines[i]);
+			defines_wide[i][0] = L'-';
+			defines_wide[i][1] = L'D';
+			utf8ToWide(defines_wide[i] + 2, GPU_KERNEL_DEFINE_MAX_LEN, desc->defines[i]);
+			defines_wide[i][GPU_KERNEL_DEFINE_MAX_LEN + 2] = '\0';
 		}
 
 		// Compiler arguments

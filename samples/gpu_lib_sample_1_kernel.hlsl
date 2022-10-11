@@ -1,12 +1,3 @@
-typedef int i32;
-typedef int2 i32x2;
-typedef int3 i32x3;
-typedef int4 i32x4;
-typedef float4 f32x4;
-
-RWByteAddressBuffer gpu_global_heap : register(u0);
-RWTexture2D<f32x4> gpu_rwtex_array[] : register(u1);
-
 cbuffer LaunchParams : register(b0) {
 	i32x2 res;
 	i32 padding1;
@@ -27,4 +18,7 @@ void CSMain(
 
 	RWTexture2D<f32x4> swapchain_rt = gpu_rwtex_array[0];
 	swapchain_rt[idx] = f32x4(0.0, 1.0, 0.0, 1.0);
+#ifdef A_DEFINE
+	swapchain_rt[idx] = f32x4(1.0, 0.0, 0.0, 1.0);
+#endif
 }

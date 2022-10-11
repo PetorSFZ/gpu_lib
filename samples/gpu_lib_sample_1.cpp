@@ -71,7 +71,11 @@ i32 main(i32 argc, char* argv[])
 
 	const GpuKernelDesc kernel_desc = GpuKernelDesc{
 		.name = "Test",
-		.path = "../../samples/gpu_lib_sample_1_kernel.hlsl"
+		.path = "../../samples/gpu_lib_sample_1_kernel.hlsl",
+		.num_defines = 1,
+		.defines = {
+			"A_DEFINE"
+		}
 	};
 	const GpuKernel kernel = gpuKernelInit(gpu, &kernel_desc);
 	sfz_defer[=]() {

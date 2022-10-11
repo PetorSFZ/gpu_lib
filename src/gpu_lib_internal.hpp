@@ -97,6 +97,24 @@ sfz_struct(GpuLib) {
 	ComPtr<ID3D12Resource> swapchain_rt;
 };
 
+// Kernel prolog
+// ------------------------------------------------------------------------------------------------
+
+constexpr char GPU_KERNEL_PROLOG[] = R"(
+
+typedef int i32;
+typedef int2 i32x2;
+typedef int3 i32x3;
+typedef int4 i32x4;
+typedef float4 f32x4;
+
+RWByteAddressBuffer gpu_global_heap : register(u0);
+RWTexture2D<f32x4> gpu_rwtex_array[] : register(u1);
+
+)";
+
+constexpr u32 GPU_KERNEL_PROLOG_SIZE = sizeof(GPU_KERNEL_PROLOG) - 1; // -1 because null-terminator
+
 // Error handling
 // ------------------------------------------------------------------------------------------------
 

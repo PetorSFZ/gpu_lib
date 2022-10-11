@@ -88,7 +88,7 @@ sfz_struct(GpuKernelDesc) {
 	const char* name;
 	const char* path;
 	u32 num_defines;
-	const char* const* defines;
+	const char* defines[];
 };
 
 sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc);
