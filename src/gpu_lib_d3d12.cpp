@@ -318,6 +318,7 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 	gpu->info_queue = info_queue;
 
 	gpu->gpu_heap = gpu_heap;
+	gpu->gpu_heap_next_free = GPU_HEAP_SYSTEM_RESERVED_SIZE;
 
 	gpu->tex_descriptor_heap = tex_descriptor_heap;
 	gpu->num_tex_descriptors = num_tex_descriptors;
@@ -363,15 +364,27 @@ sfz_extern_c void gpuLibDestroy(GpuLib* gpu)
 
 sfz_extern_c GpuPtr gpuMalloc(GpuLib* gpu, u32 num_bytes)
 {
-	(void)gpu;
-	(void)num_bytes;
-	return GPU_NULLPTR;
+	// TODO: This is obviously a very bad malloc API, please implement real malloc/free.
+
+	// Check if we have enough space left
+	const u32 end = gpu->gpu_heap_next_free + num_bytes;
+	if (gpu->cfg.gpu_heap_size_bytes > end) {
+		printf("[gpu_lib]: Out of GPU memory, trying to allocate %.3f MiB.\n",
+			f32(num_bytes) / (1024.0f * 1024.0f));
+		return GPU_NULLPTR;
+	}
+
+	// Get pointer
+	const GpuPtr ptr = gpu->gpu_heap_next_free;
+	gpu->gpu_heap_next_free = sfzRoundUpAlignedU32(end, GPU_MALLOC_ALIGN);
+	return ptr;
 }
 
 sfz_extern_c void gpuFree(GpuLib* gpu, GpuPtr ptr)
 {
 	(void)gpu;
 	(void)ptr;
+	// TODO: This is obviously a very bad free API, please implement real malloc/free.
 }
 
 // Kernel API
