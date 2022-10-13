@@ -66,6 +66,15 @@ sfz_struct(GpuLib) {
 	ComPtr<ID3D12Device3> device;
 	ComPtr<ID3D12InfoQueue> info_queue;
 
+	// Commands
+	ComPtr<ID3D12CommandQueue> cmd_queue;
+	ComPtr<ID3D12Fence> cmd_queue_fence;
+	HANDLE cmd_queue_fence_event;
+	u64 cmd_queue_fence_value;
+	GpuCmdListInfo cmd_lists[GPU_NUM_CMD_LISTS];
+	u32 curr_cmd_list;
+	GpuCmdListInfo& getCurrCmdList() { return cmd_lists[curr_cmd_list]; }
+
 	// GPU Heap
 	ComPtr<ID3D12Resource> gpu_heap;
 	D3D12_RESOURCE_STATES gpu_heap_state;
@@ -88,15 +97,6 @@ sfz_struct(GpuLib) {
 	u32 tex_descriptor_size;
 	D3D12_CPU_DESCRIPTOR_HANDLE tex_descriptor_heap_start_cpu;
 	D3D12_GPU_DESCRIPTOR_HANDLE tex_descriptor_heap_start_gpu;
-
-	// Commands
-	ComPtr<ID3D12CommandQueue> cmd_queue;
-	ComPtr<ID3D12Fence> cmd_queue_fence;
-	HANDLE cmd_queue_fence_event;
-	u64 cmd_queue_fence_value;
-	GpuCmdListInfo cmd_lists[GPU_NUM_CMD_LISTS];
-	u32 curr_cmd_list;
-	GpuCmdListInfo& getCurrCmdList() { return cmd_lists[curr_cmd_list]; }
 
 	// DXC compiler
 	ComPtr<IDxcUtils> dxc_utils; // Not thread-safe

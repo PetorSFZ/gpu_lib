@@ -109,6 +109,62 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 		CHECK_D3D12(info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, TRUE));
 	}
 
+	// Create command queue
+	ComPtr<ID3D12CommandQueue> cmd_queue;
+	ComPtr<ID3D12Fence> cmd_queue_fence;
+	HANDLE cmd_queue_fence_event = nullptr;
+	{
+		D3D12_COMMAND_QUEUE_DESC queue_desc = {};
+		queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+		queue_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+		queue_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE; // D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT
+		queue_desc.NodeMask = 0;
+		if (!CHECK_D3D12(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&cmd_queue)))) {
+			printf("[gpu_lib]: Could not create command queue.\n");
+			return nullptr;
+		}
+
+		if (!CHECK_D3D12(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&cmd_queue_fence)))) {
+			printf("[gpu_lib]: Could not create command queue fence.\n");
+			return nullptr;
+		}
+
+		cmd_queue_fence_event = CreateEventA(NULL, false, false, "gpu_lib_cmd_queue_fence_event");
+	}
+
+	// Create command lists
+	GpuCmdListInfo cmd_lists[GPU_NUM_CMD_LISTS];
+	for (u32 i = 0; i < GPU_NUM_CMD_LISTS; i++) {
+		GpuCmdListInfo& info = cmd_lists[i];
+
+		if (!CHECK_D3D12(device->CreateCommandAllocator(
+			D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&info.cmd_allocator)))) {
+			printf("[gpu_lib]: Could not create command allocator.\n");
+			return nullptr;
+		}
+
+		if (!CHECK_D3D12(device->CreateCommandList(
+			0,
+			D3D12_COMMAND_LIST_TYPE_DIRECT,
+			info.cmd_allocator.Get(),
+			nullptr,
+			IID_PPV_ARGS(&info.cmd_list)))) {
+
+			printf("[gpu_lib]: Could not create command list.\n");
+			return nullptr;
+		}
+
+		// Close the non active command lists
+		if (i != 0) {
+			if (!CHECK_D3D12(info.cmd_list->Close())) {
+				printf("[gpu_lib]: Could not close command list after creation.\n");
+				return nullptr;
+			}
+		}
+
+		info.fence_value = 0;
+	}
+
 	// Allocate our gpu heap
 	ComPtr<ID3D12Resource> gpu_heap;
 	{
@@ -260,68 +316,6 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 		tex_descriptor_heap_start_gpu = tex_descriptor_heap->GetGPUDescriptorHandleForHeapStart();
 	}
 
-	// Create command queue
-	ComPtr<ID3D12CommandQueue> cmd_queue;
-	ComPtr<ID3D12Fence> cmd_queue_fence;
-	HANDLE cmd_queue_fence_event = nullptr;
-	{
-		D3D12_COMMAND_QUEUE_DESC queue_desc = {};
-		queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-		queue_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
-		queue_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE; // D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT
-		queue_desc.NodeMask = 0;
-		if (!CHECK_D3D12(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&cmd_queue)))) {
-			printf("[gpu_lib]: Could not create command queue.\n");
-			return nullptr;
-		}
-
-		if (!CHECK_D3D12(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&cmd_queue_fence)))) {
-			printf("[gpu_lib]: Could not create command queue fence.\n");
-			return nullptr;
-		}
-
-		cmd_queue_fence_event = CreateEventA(NULL, false, false, "gpu_lib_cmd_queue_fence_event");
-	}
-
-	// Create command lists
-	GpuCmdListInfo cmd_lists[GPU_NUM_CMD_LISTS];
-	for (u32 i = 0; i < GPU_NUM_CMD_LISTS; i++) {
-		GpuCmdListInfo& info = cmd_lists[i];
-
-		if (!CHECK_D3D12(device->CreateCommandAllocator(
-			D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&info.cmd_allocator)))) {
-			printf("[gpu_lib]: Could not create command allocator.\n");
-			return nullptr;
-		}
-
-		if (!CHECK_D3D12(device->CreateCommandList(
-			0,
-			D3D12_COMMAND_LIST_TYPE_DIRECT,
-			info.cmd_allocator.Get(),
-			nullptr,
-			IID_PPV_ARGS(&info.cmd_list)))) {
-
-			printf("[gpu_lib]: Could not create command list.\n");
-			return nullptr;
-		}
-
-		// Close the non active command lists
-		if (i != 0) {
-			if (!CHECK_D3D12(info.cmd_list->Close())) {
-				printf("[gpu_lib]: Could not close command list after creation.\n");
-				return nullptr;
-			}
-		}
-
-		// Set texture descriptor heap for initial command list
-		if (i == 0) {
-			ID3D12DescriptorHeap* heaps[] = { tex_descriptor_heap.Get() };
-			info.cmd_list->SetDescriptorHeaps(1, heaps);
-		}
-
-		info.fence_value = 0;
-	}
-
 	// Load DXC compiler
 	ComPtr<IDxcUtils> dxc_utils;
 	ComPtr<IDxcCompiler3> dxc_compiler;
@@ -435,6 +429,7 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 	gpu->swapchain = swapchain;
 
 	// Do a quick present after initialization has finished, used to set up framebuffers
+	gpuSubmitQueuedWork(gpu);
 	gpuSwapchainPresent(gpu, false);
 
 	return gpu;
@@ -735,7 +730,7 @@ sfz_extern_c i32x3 gpuKernelGetGroupDims(const GpuLib* gpu, GpuKernel kernel)
 	return info->group_dims;
 }
 
-// Submission API
+// Command API
 // ------------------------------------------------------------------------------------------------
 
 sfz_extern_c i32x2 gpuSwapchainGetRes(GpuLib* gpu)
@@ -842,7 +837,7 @@ sfz_extern_c void gpuQueueDispatch(
 sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu)
 {
 	// Copy contents from swapchain RT to actual swapchain
-	if (gpu->swapchain != nullptr) {
+	if (gpu->swapchain != nullptr && gpu->swapchain_rt != nullptr) {
 		GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
 
 		// Grab current swapchain render target and descriptor heap

@@ -116,21 +116,30 @@ inline i32 gpuKernelGetGroupDims1(const GpuLib* gpu, GpuKernel kernel)
 }
 
 
-// Submission API
+// Command API
 // ------------------------------------------------------------------------------------------------
 
-// Submission API is what you are primarily going to be using frame to frame. The functions are
+// The Command API is what you are primarily going to be using frame to frame. The functions are
 // ordered in approximately the order you are expected to call them per-frame.
 
+// Returns the current resolution of the swapchain (window) being rendered to.
 sfz_extern_c i32x2 gpuSwapchainGetRes(GpuLib* gpu);
 
+// Queues an upload to the GPU. Instantly copies input to upload heap, no need to keep src around.
 sfz_extern_c void gpuQueueMemcpyUpload(GpuLib* gpu, GpuPtr dst, const void* src, u32 num_bytes);
 
+// Queues a kernel dispatch
 sfz_extern_c void gpuQueueDispatch(
 	GpuLib* gpu, GpuKernel kernel, i32x3 num_groups, const void* params, u32 params_size);
 
+// Submits queued work to GPU and prepares to start recording more.
 sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu);
+
+// Presents the latest swapchain image to the screen. Will block GPU and resize swapchain if
+// resolution has changed.
 sfz_extern_c void gpuSwapchainPresent(GpuLib* gpu, bool vsync);
+
+// Flushes (blocks) until all currently submitted GPU work has finished executing.
 sfz_extern_c void gpuFlush(GpuLib* gpu);
 
 
