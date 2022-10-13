@@ -125,6 +125,12 @@ inline i32 gpuKernelGetGroupDims1(const GpuLib* gpu, GpuKernel kernel)
 // Returns the current resolution of the swapchain (window) being rendered to.
 sfz_extern_c i32x2 gpuSwapchainGetRes(GpuLib* gpu);
 
+// Returns the number of ticks per second (i.e. frequency) of the gpu timestamps.
+sfz_extern_c u64 gpuTimestampGetFreq(GpuLib* gpu);
+
+// Takes a timestamp and stores it in the u64 pointed to in the global heap.
+sfz_extern_c void gpuQueueTakeTimestamp(GpuLib* gpu, GpuPtr dst);
+
 // Queues an upload to the GPU. Instantly copies input to upload heap, no need to keep src around.
 sfz_extern_c void gpuQueueMemcpyUpload(GpuLib* gpu, GpuPtr dst, const void* src, u32 num_bytes);
 

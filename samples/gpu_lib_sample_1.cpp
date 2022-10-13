@@ -76,15 +76,23 @@ i32 main(i32 argc, char* argv[])
 		.path = "../../samples/gpu_lib_sample_1_kernel.hlsl",
 	};
 	const GpuKernel kernel = gpuKernelInit(gpu, &kernel_desc);
+	sfz_assert(kernel != GPU_NULL_KERNEL);
 	sfz_defer[=]() {
 		gpuKernelDestroy(gpu, kernel);
 	};
 
-	GpuPtr color_ptr = gpuMalloc(gpu, sizeof(f32x4));
+	const GpuPtr color_ptr = gpuMalloc(gpu, sizeof(f32x4));
 	sfz_assert(color_ptr != GPU_NULLPTR);
 	sfz_defer[=]() {
 		gpuFree(gpu, color_ptr);
 	};
+
+	const GpuPtr timestamp_ptr = gpuMalloc(gpu, sizeof(u64));
+	sfz_assert(timestamp_ptr != GPU_NULLPTR);
+	sfz_defer[=]() {
+		gpuFree(gpu, timestamp_ptr);
+	};
+	const u64 timestamp_freq = gpuTimestampGetFreq(gpu);
 
 	f32x4 color = f32x4_init(0.0f, 0.0f, 0.0f, 1.0f);
 
@@ -112,6 +120,8 @@ i32 main(i32 argc, char* argv[])
 			return true;
 			}()) continue;
 
+		gpuQueueTakeTimestamp(gpu, timestamp_ptr);
+
 		color.x += 0.01f;
 		if (color.x > 1.0f) color.x -= 1.0f;
 		gpuQueueMemcpyUpload(gpu, color_ptr, &color, sizeof(color));
@@ -133,6 +143,9 @@ i32 main(i32 argc, char* argv[])
 		gpuSubmitQueuedWork(gpu);
 		gpuSwapchainPresent(gpu, true);
 	}
+
+	// Do want to flush before all destructors run, otherwise we might end up trying to destroy
+	// stuff in-flight on GPU.
 	gpuFlush(gpu);
 
 	return 0;

@@ -165,6 +165,20 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 		info.fence_value = 0;
 	}
 
+	// Create timestamp stuff
+	ComPtr<ID3D12QueryHeap> timestamp_query_heap;
+	{
+		D3D12_QUERY_HEAP_DESC query_desc = {};
+		query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+		query_desc.Count = 1;
+		query_desc.NodeMask = 0;
+		if (!CHECK_D3D12(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&timestamp_query_heap)))) {
+			printf("[gpu_lib]: Could not create timestap query heap.\n");
+			return nullptr;
+		}
+		setDebugNameLazy(timestamp_query_heap);
+	}
+
 	// Allocate our gpu heap
 	ComPtr<ID3D12Resource> gpu_heap;
 	{
@@ -199,6 +213,7 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 				gpuPrintToMiB(cfg.gpu_heap_size_bytes));
 			return nullptr;
 		}
+		setDebugNameLazy(gpu_heap);
 	}
 
 	// Allocate upload heap
@@ -237,6 +252,7 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 				gpuPrintToMiB(cfg.upload_heap_size_bytes));
 			return nullptr;
 		}
+		setDebugNameLazy(upload_heap);
 
 		void* mapped_ptr = nullptr;
 		if (!CHECK_D3D12(upload_heap->Map(0, nullptr, &mapped_ptr))) {
@@ -282,6 +298,7 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 				gpuPrintToMiB(cfg.download_heap_size_bytes));
 			return nullptr;
 		}
+		setDebugNameLazy(download_heap);
 
 		void* mapped_ptr = nullptr;
 		if (!CHECK_D3D12(download_heap->Map(0, nullptr, &mapped_ptr))) {
@@ -310,6 +327,7 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 				num_tex_descriptors);
 			return nullptr;
 		}
+		setDebugNameLazy(tex_descriptor_heap);
 
 		tex_descriptor_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 		tex_descriptor_heap_start_cpu = tex_descriptor_heap->GetCPUDescriptorHandleForHeapStart();
@@ -395,6 +413,15 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 	gpu->device = device;
 	gpu->info_queue = info_queue;
 
+	gpu->cmd_queue = cmd_queue;
+	gpu->cmd_queue_fence = cmd_queue_fence;
+	gpu->cmd_queue_fence_event = cmd_queue_fence_event;
+	gpu->cmd_queue_fence_value = 0;
+	for (u32 i = 0; i < GPU_NUM_CMD_LISTS; i++) gpu->cmd_lists[i] = cmd_lists[i];
+	gpu->curr_cmd_list = 0;
+
+	gpu->timestamp_query_heap = timestamp_query_heap;
+
 	gpu->gpu_heap = gpu_heap;
 	gpu->gpu_heap_state = D3D12_RESOURCE_STATE_COMMON;
 	gpu->gpu_heap_next_free = GPU_HEAP_SYSTEM_RESERVED_SIZE;
@@ -411,13 +438,6 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 	gpu->tex_descriptor_size = tex_descriptor_size;
 	gpu->tex_descriptor_heap_start_cpu = tex_descriptor_heap_start_cpu;
 	gpu->tex_descriptor_heap_start_gpu = tex_descriptor_heap_start_gpu;
-
-	gpu->cmd_queue = cmd_queue;
-	gpu->cmd_queue_fence = cmd_queue_fence;
-	gpu->cmd_queue_fence_event = cmd_queue_fence_event;
-	gpu->cmd_queue_fence_value = 0;
-	for (u32 i = 0; i < GPU_NUM_CMD_LISTS; i++) gpu->cmd_lists[i] = cmd_lists[i];
-	gpu->curr_cmd_list = 0;
 
 	gpu->dxc_utils = dxc_utils;
 	gpu->dxc_compiler = dxc_compiler;
@@ -682,6 +702,7 @@ sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc)
 			printf("[gpu_lib]: Failed to create root signature\n");
 			return GPU_NULL_KERNEL;
 		} 
+		setDebugName(root_sig.Get(), desc->name);
 	}
 
 	// Create PSO (Pipeline State Object)
@@ -701,6 +722,7 @@ sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc)
 			printf("[gpu_lib]: Failed to create pso\n");
 			return GPU_NULL_KERNEL;
 		}
+		setDebugName(pso.Get(), desc->name);
 	}
 
 	// Store kernel data and return handle
@@ -736,6 +758,46 @@ sfz_extern_c i32x3 gpuKernelGetGroupDims(const GpuLib* gpu, GpuKernel kernel)
 sfz_extern_c i32x2 gpuSwapchainGetRes(GpuLib* gpu)
 {
 	return gpu->swapchain_res;
+}
+
+sfz_extern_c u64 gpuTimestampGetFreq(GpuLib* gpu)
+{
+	u64 ticks_per_sec = 0;
+	if (!CHECK_D3D12(gpu->cmd_queue->GetTimestampFrequency(&ticks_per_sec))) {
+		printf("[gpu_lib]: Couldn't get timestamp frequency.\n");
+		return 0;
+	}
+	return ticks_per_sec;
+}
+
+sfz_extern_c void gpuQueueTakeTimestamp(GpuLib* gpu, GpuPtr dst)
+{
+	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
+
+	// Ensure heap is in COPY_DEST state
+	if (gpu->gpu_heap_state != D3D12_RESOURCE_STATE_COPY_DEST) {
+		D3D12_RESOURCE_BARRIER barrier = {};
+		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+		barrier.Transition.pResource = gpu->gpu_heap.Get();
+		barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		barrier.Transition.StateBefore = gpu->gpu_heap_state;
+		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+		cmd_list_info.cmd_list->ResourceBarrier(1, &barrier);
+		gpu->gpu_heap_state = D3D12_RESOURCE_STATE_COPY_DEST;
+	}
+
+	// Get timestamp and store it in u64 pointed to by gpu pointer
+	const u32 timestamp_idx = 0; // We only need one slot because we immediately copy out the data
+	cmd_list_info.cmd_list->EndQuery(
+		gpu->timestamp_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, timestamp_idx);
+	cmd_list_info.cmd_list->ResolveQueryData(
+		gpu->timestamp_query_heap.Get(),
+		D3D12_QUERY_TYPE_TIMESTAMP,
+		timestamp_idx,
+		1,
+		gpu->gpu_heap.Get(),
+		dst);
 }
 
 sfz_extern_c void gpuQueueMemcpyUpload(GpuLib* gpu, GpuPtr dst, const void* src, u32 num_bytes_original)
@@ -1041,6 +1103,7 @@ sfz_extern_c void gpuSwapchainPresent(GpuLib* gpu, bool vsync)
 					window_res.x, window_res.y);
 				return;
 			}
+			setDebugName(gpu->swapchain_rt.Get(), "swapchain_rt");
 		}
 
 		// Set swapchain RT descriptor in tex descriptor heap

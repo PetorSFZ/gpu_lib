@@ -75,6 +75,9 @@ sfz_struct(GpuLib) {
 	u32 curr_cmd_list;
 	GpuCmdListInfo& getCurrCmdList() { return cmd_lists[curr_cmd_list]; }
 
+	// Timestamps
+	ComPtr<ID3D12QueryHeap> timestamp_query_heap;
+
 	// GPU Heap
 	ComPtr<ID3D12Resource> gpu_heap;
 	D3D12_RESOURCE_STATES gpu_heap_state;
@@ -195,6 +198,13 @@ inline WideStr expandUtf8(const char* utf8)
 	(void)num_wide_chars;
 	return wide;
 }
+
+inline void setDebugName(ID3D12Object* object, const char* name)
+{
+	const WideStr wide_name = expandUtf8(name);
+	CHECK_D3D12(object->SetName(wide_name.str));
+}
+#define setDebugNameLazy(name) setDebugName(name.Get(), #name);
 
 // IO functions
 // ------------------------------------------------------------------------------------------------
