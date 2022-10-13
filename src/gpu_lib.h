@@ -29,6 +29,7 @@ sfz_struct(GpuLibInitCfg) {
 	u32 gpu_heap_size_bytes;
 	u32 upload_heap_size_bytes;
 	u32 download_heap_size_bytes;
+	u32 max_num_concurrent_downloads;
 	u32 max_num_textures_per_type;
 	u32 max_num_kernels;
 	
@@ -134,6 +135,23 @@ sfz_extern_c void gpuQueueTakeTimestamp(GpuLib* gpu, GpuPtr dst);
 // Queues an upload to the GPU. Instantly copies input to upload heap, no need to keep src around.
 sfz_extern_c void gpuQueueMemcpyUpload(GpuLib* gpu, GpuPtr dst, const void* src, u32 num_bytes);
 
+sfz_struct(GpuTicket) {
+	u32 handle;
+
+#ifdef __cplusplus
+	constexpr bool operator== (GpuTicket o) const { return handle == o.handle; }
+	constexpr bool operator!= (GpuTicket o) const { return handle != o.handle; }
+#endif
+};
+sfz_constant GpuTicket GPU_NULL_TICKET = {};
+
+// Queues a download to the CPU. Downloading takes time, returns a ticket that can be used to
+// retrieve the data in a later frame when it's ready.
+sfz_extern_c GpuTicket gpuQueueMemcpyDownload(GpuLib* gpu, GpuPtr src, u32 num_bytes);
+
+// Retrieves the data from a previously queued memcpy download.
+sfz_extern_c void gpuGetDownloadedData(GpuLib* gpu, GpuTicket ticket, void* dst, u32 num_bytes);
+
 // Queues a kernel dispatch
 sfz_extern_c void gpuQueueDispatch(
 	GpuLib* gpu, GpuKernel kernel, i32x3 num_groups, const void* params, u32 params_size);
@@ -157,19 +175,27 @@ sfz_extern_c void gpuFlush(GpuLib* gpu);
 #ifdef __cplusplus
 
 template<typename T>
-inline void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32x3 num_groups, const T& params)
+T gpuGetDownloadedData(GpuLib* gpu, GpuTicket ticket)
+{
+	T tmp = {};
+	gpuGetDownloadedData(gpu, ticket, &tmp, sizeof(T));
+	return tmp;
+}
+
+template<typename T>
+void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32x3 num_groups, const T& params)
 {
 	gpuQueueDispatch(gpu, kernel, num_groups, &params, sizeof(T));
 }
 
 template<typename T>
-inline void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32x2 num_groups, const T& params)
+void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32x2 num_groups, const T& params)
 {
 	gpuQueueDispatch<T>(gpu, kernel, i32x3_init2(num_groups, 1), params);
 }
 
 template<typename T>
-inline void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32 num_groups, const T& params)
+void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32 num_groups, const T& params)
 {
 	gpuQueueDispatch<T>(gpu, kernel, i32x3_init(num_groups, 1, 1), params);
 }

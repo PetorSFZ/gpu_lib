@@ -58,6 +58,11 @@ sfz_struct(GpuKernelInfo) {
 	u32 launch_params_size;
 };
 
+sfz_struct(GpuPendingDownload) {
+	u32 heap_offset;
+	u32 num_bytes;
+};
+
 sfz_struct(GpuLib) {
 	GpuLibInitCfg cfg;
 
@@ -93,6 +98,8 @@ sfz_struct(GpuLib) {
 	// Download heap
 	ComPtr<ID3D12Resource> download_heap;
 	u8* download_heap_mapped_ptr;
+	u64 download_heap_head_offset;
+	sfz::Pool<GpuPendingDownload> downloads;
 
 	// RWTex descriptor heap
 	ComPtr<ID3D12DescriptorHeap> tex_descriptor_heap;

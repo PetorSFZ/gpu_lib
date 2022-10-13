@@ -53,6 +53,7 @@ i32 main(i32 argc, char* argv[])
 		.gpu_heap_size_bytes = 2u * 1024u * 1024u * 1024u,//U32_MAX,
 		.upload_heap_size_bytes = 128 * 1024 * 1024,
 		.download_heap_size_bytes = 128 * 1024 * 1024,
+		.max_num_concurrent_downloads = 1024,
 		.max_num_textures_per_type = 1024,
 		.max_num_kernels = 128,
 		
@@ -92,9 +93,27 @@ i32 main(i32 argc, char* argv[])
 	sfz_defer[=]() {
 		gpuFree(gpu, timestamp_ptr);
 	};
-	const u64 timestamp_freq = gpuTimestampGetFreq(gpu);
 
 	f32x4 color = f32x4_init(0.0f, 0.0f, 0.0f, 1.0f);
+
+	// Retrieve the initial gpu timestamp
+	const u64 timestamp_freq = gpuTimestampGetFreq(gpu);
+	u64 initial_gpu_timestamp = 0;
+	{
+		gpuQueueTakeTimestamp(gpu, timestamp_ptr);
+		const GpuTicket ticket = gpuQueueMemcpyDownload(gpu, timestamp_ptr, sizeof(u64));
+		gpuSubmitQueuedWork(gpu);
+		gpuFlush(gpu);
+		initial_gpu_timestamp = gpuGetDownloadedData<u64>(gpu, ticket);
+	}
+
+	GpuTicket timestamp_tickets[3] = {};
+	u32 curr_timestamp_ticket = 0;
+	auto getCurrTimestampTicket = [&]() -> GpuTicket& {
+		GpuTicket& ticket = timestamp_tickets[curr_timestamp_ticket];
+		curr_timestamp_ticket = (curr_timestamp_ticket + 1) % 3;
+		return ticket;
+	};
 
 	// Run our main loop
 	bool running = true;
@@ -120,7 +139,21 @@ i32 main(i32 argc, char* argv[])
 			return true;
 			}()) continue;
 
+		// Take timestamp
 		gpuQueueTakeTimestamp(gpu, timestamp_ptr);
+
+		// Grab timestamp ticket from our queue and check if the download is ready
+		GpuTicket& timestamp_ticket = getCurrTimestampTicket();
+		if (timestamp_ticket != GPU_NULL_TICKET) {
+			const u64 timestamp = gpuGetDownloadedData<u64>(gpu, timestamp_ticket);
+			timestamp_ticket = GPU_NULL_TICKET;
+			const u64 diff = timestamp - initial_gpu_timestamp;
+			printf("Current GPU time: %.3f, raw: %llu\n",
+				f32(f64(diff) / f64(timestamp_freq)), timestamp);
+		}
+
+		// Start timestamp download
+		timestamp_ticket = gpuQueueMemcpyDownload(gpu, timestamp_ptr, sizeof(u64));
 
 		color.x += 0.01f;
 		if (color.x > 1.0f) color.x -= 1.0f;

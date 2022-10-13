@@ -432,6 +432,8 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 
 	gpu->download_heap = download_heap;
 	gpu->download_heap_mapped_ptr = download_heap_mapped_ptr;
+	gpu->download_heap_head_offset = 0;
+	gpu->downloads.init(cfg.max_num_concurrent_downloads, cfg.cpu_allocator, sfz_dbg("GpuLib::downloads"));
 
 	gpu->tex_descriptor_heap = tex_descriptor_heap;
 	gpu->num_tex_descriptors = num_tex_descriptors;
@@ -774,6 +776,11 @@ sfz_extern_c void gpuQueueTakeTimestamp(GpuLib* gpu, GpuPtr dst)
 {
 	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
 
+	// Note: This isn't necessarily the fastest/least blocking path. We could query the result
+	//       directly to the download heap, and in that case there would be no need to insert a
+	//       barrier on the global heap. OTOH, we already need this barrier for memcpy uploads, so
+	//       might not matter much.
+
 	// Ensure heap is in COPY_DEST state
 	if (gpu->gpu_heap_state != D3D12_RESOURCE_STATE_COPY_DEST) {
 		D3D12_RESOURCE_BARRIER barrier = {};
@@ -803,6 +810,10 @@ sfz_extern_c void gpuQueueTakeTimestamp(GpuLib* gpu, GpuPtr dst)
 sfz_extern_c void gpuQueueMemcpyUpload(GpuLib* gpu, GpuPtr dst, const void* src, u32 num_bytes_original)
 {
 	if (num_bytes_original == 0) return;
+	if (dst < GPU_HEAP_SYSTEM_RESERVED_SIZE || gpu->cfg.gpu_heap_size_bytes <= dst) {
+		printf("[gpu_lib]: Trying to memcpy upload to an invalid pointer (%u)\n", dst);
+		return;
+	}
 	u32 num_bytes = sfzRoundUpAlignedU32(num_bytes_original, 256); // Only allocate 256-byte aligned ranges
 
 	// Try to allocate range in upload heap
@@ -844,6 +855,86 @@ sfz_extern_c void gpuQueueMemcpyUpload(GpuLib* gpu, GpuPtr dst, const void* src,
 	// Copy to heap
 	cmd_list_info.cmd_list->CopyBufferRegion(
 		gpu->gpu_heap.Get(), dst, gpu->upload_heap.Get(), upload_heap_begin, num_bytes_original);
+}
+
+sfz_extern_c GpuTicket gpuQueueMemcpyDownload(GpuLib* gpu, GpuPtr src, u32 num_bytes)
+{
+	if (num_bytes == 0) return GPU_NULL_TICKET;
+	if (src < GPU_HEAP_SYSTEM_RESERVED_SIZE || gpu->cfg.gpu_heap_size_bytes <= src) {
+		printf("[gpu_lib]: Trying to memcpy download from an invalid pointer (%u)\n", src);
+		return GPU_NULL_TICKET;
+	}
+
+	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
+
+	// Try to allocate range in download heap
+	u64 download_heap_begin = gpu->download_heap_head_offset;
+	u64 download_heap_end = gpu->download_heap_head_offset + num_bytes;
+	if (download_heap_end > gpu->cfg.download_heap_size_bytes) {
+		// Overflow, let's try allocating in beginning of download heap instead
+		download_heap_begin = 0;
+		download_heap_end = num_bytes;
+	}
+
+	// TODO: Should actually check safe offsets
+	if (download_heap_end > gpu->cfg.download_heap_size_bytes) {
+		printf("[gpu_lib]: Can't memcpy download %.2f MiB, download heap is of size %.2f MiB\n",
+			gpuPrintToMiB(num_bytes), gpuPrintToMiB(gpu->cfg.download_heap_size_bytes));
+		return GPU_NULL_TICKET;
+	}
+
+	gpu->download_heap_head_offset = download_heap_end;
+
+	// Ensure heap is in COPY_SOURCE state
+	if (gpu->gpu_heap_state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+		D3D12_RESOURCE_BARRIER barrier = {};
+		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+		barrier.Transition.pResource = gpu->gpu_heap.Get();
+		barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		barrier.Transition.StateBefore = gpu->gpu_heap_state;
+		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+		cmd_list_info.cmd_list->ResourceBarrier(1, &barrier);
+		gpu->gpu_heap_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	}
+
+	// Copy to download heap
+	cmd_list_info.cmd_list->CopyBufferRegion(
+		gpu->download_heap.Get(), download_heap_begin, gpu->gpu_heap.Get(), src, num_bytes);
+
+	// Allocate a pending download slot
+	const SfzHandle download_handle = gpu->downloads.allocate();
+	if (download_handle == SFZ_NULL_HANDLE) {
+		printf("[gpu_lib]: Out of room for more concurrent downloads (max %u)\n",
+			gpu->cfg.max_num_concurrent_downloads);
+		return GPU_NULL_TICKET;
+	}
+
+	// Store data for the pending download
+	GpuPendingDownload& pending = *gpu->downloads.get(download_handle);
+	pending.heap_offset = u32(download_heap_begin);
+	pending.num_bytes = num_bytes;
+	// TODO: Synchronization (frame/submit number, fence idx, etc)
+
+	const GpuTicket ticket = { download_handle.bits };
+	return ticket;
+}
+
+sfz_extern_c void gpuGetDownloadedData(GpuLib* gpu, GpuTicket ticket, void* dst, u32 num_bytes)
+{
+	const SfzHandle handle = SfzHandle{ ticket.handle };
+	GpuPendingDownload* pending = gpu->downloads.get(handle);
+	if (pending == nullptr) {
+		printf("[gpu_lib]: Invalid ticket.\n");
+		return;
+	}
+	if (pending->num_bytes != num_bytes) {
+		printf("[gpu_lib]: Memcpy download size mismatch, requested %u bytes, but %u was downloaded\n",
+			num_bytes, pending->num_bytes);
+		return;
+	}
+	memcpy(dst, gpu->download_heap_mapped_ptr + pending->heap_offset, num_bytes);
+	gpu->downloads.deallocate(handle);
 }
 
 sfz_extern_c void gpuQueueDispatch(
