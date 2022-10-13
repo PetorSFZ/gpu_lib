@@ -25,6 +25,8 @@ sfz_struct(GpuLibInitCfg) {
 
 	SfzAllocator* cpu_allocator;
 	u32 gpu_heap_size_bytes;
+	u32 upload_heap_size_bytes;
+	u32 download_heap_size_bytes;
 	u32 max_num_textures_per_type;
 	u32 max_num_kernels;
 	
@@ -110,6 +112,8 @@ inline i32 gpuKernelGetGroupDims1(const GpuLib* gpu, GpuKernel kernel)
 
 // Submission API
 // ------------------------------------------------------------------------------------------------
+
+sfz_extern_c void gpuQueueMemcpyUpload(GpuLib* gpu, GpuPtr dst, const void* src, u32 num_bytes);
 
 sfz_extern_c i32x2 gpuSwapchainGetRes(GpuLib* gpu);
 

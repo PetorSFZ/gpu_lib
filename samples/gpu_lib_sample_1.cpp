@@ -50,7 +50,9 @@ i32 main(i32 argc, char* argv[])
 	// Initialize gpu_lib
 	const GpuLibInitCfg gpu_init_cfg = GpuLibInitCfg{
 		.cpu_allocator = &global_cpu_allocator,
-		.gpu_heap_size_bytes = 1u * 1024u * 1024u * 1024u,//U32_MAX,
+		.gpu_heap_size_bytes = 2u * 1024u * 1024u * 1024u,//U32_MAX,
+		.upload_heap_size_bytes = 128 * 1024 * 1024,
+		.download_heap_size_bytes = 128 * 1024 * 1024,
 		.max_num_textures_per_type = 1024,
 		.max_num_kernels = 128,
 		
@@ -82,6 +84,14 @@ i32 main(i32 argc, char* argv[])
 		gpuKernelDestroy(gpu, kernel);
 	};
 
+	GpuPtr color_ptr = gpuMalloc(gpu, sizeof(f32x4));
+	sfz_assert(color_ptr != GPU_NULLPTR);
+	sfz_defer[=]() {
+		gpuFree(gpu, color_ptr);
+	};
+
+	f32x4 color = f32x4_init(0.0f, 0.0f, 0.0f, 1.0f);
+
 	// Run our main loop
 	bool running = true;
 	while (running) {
@@ -106,6 +116,10 @@ i32 main(i32 argc, char* argv[])
 			return true;
 			}()) continue;
 
+		color.x += 0.01f;
+		if (color.x > 1.0f) color.x -= 1.0f;
+		gpuQueueMemcpyUpload(gpu, color_ptr, &color, sizeof(color));
+
 		gpuQueueSwapchainBegin(gpu);
 		const i32x2 res = gpuSwapchainGetRes(gpu);
 		const i32x2 group_dims = gpuKernelGetGroupDims2(gpu, kernel);
@@ -113,12 +127,13 @@ i32 main(i32 argc, char* argv[])
 
 		struct {
 			i32x2 res;
-			i32 padding1;
-			i32 padding2;
+			GpuPtr color_ptr;
+			i32 padding;
+			
 		} params;
 		params.res = res;
+		params.color_ptr = color_ptr;
 		gpuQueueDispatch2(gpu, kernel, num_groups, GPU_LAUNCH_PARAMS(params));
-		//gpuQueueDispatch2(gpu, kernel, num_groups, GPU_LAUNCH_NO_PARAMS);
 
 		gpuQueueSwapchainEnd(gpu);
 		gpuSubmitQueuedWork(gpu);

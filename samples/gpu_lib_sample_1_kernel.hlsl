@@ -6,8 +6,8 @@ typedef float4 f32x4;
 
 cbuffer LaunchParams : register(b0) {
 	i32x2 res;
-	i32 padding1;
-	i32 padding2;
+	GpuPtr color_ptr;
+	i32 padding;
 }
 
 [numthreads(16, 16, 1)]
@@ -20,11 +20,6 @@ void CSMain(
 	const i32x2 idx = dispatch_thread_idx.xy;
 	if (res.x <= idx.x || res.y <= idx.y) return;
 
-	if (idx.x == 0 && idx.y == 0) gpu_global_heap.Store(0, 42);
-
 	RWTexture2D<f32x4> swapchain_rt = getSwapchainRT();
-	swapchain_rt[idx] = f32x4(0.0, 1.0, 0.0, 1.0);
-#ifdef A_DEFINE
-	swapchain_rt[idx] = f32x4(1.0, 0.0, 0.0, 1.0);
-#endif
+	swapchain_rt[idx] = ptrLoad<float4>(color_ptr);
 }

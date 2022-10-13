@@ -68,7 +68,19 @@ sfz_struct(GpuLib) {
 
 	// GPU Heap
 	ComPtr<ID3D12Resource> gpu_heap;
+	D3D12_RESOURCE_STATES gpu_heap_state;
 	u32 gpu_heap_next_free;
+
+	// Upload heap
+	ComPtr<ID3D12Resource> upload_heap;
+	u8* upload_heap_mapped_ptr;
+	u64 upload_heap_head_offset;
+	//u64 upload_heap_safe_offsets[GPU_NUM_CMD_LISTS];
+	//u64& getCurrUploadHeapSafeOffset() { return upload_heap_safe_offsets[currCmdList]; }
+
+	// Download heap
+	ComPtr<ID3D12Resource> download_heap;
+	u8* download_heap_mapped_ptr;
 
 	// RWTex descriptor heap
 	ComPtr<ID3D12DescriptorHeap> tex_descriptor_heap;
@@ -102,6 +114,8 @@ sfz_struct(GpuLib) {
 
 // Error handling
 // ------------------------------------------------------------------------------------------------
+
+inline f32 gpuPrintToMiB(u64 bytes) { return f32(f64(bytes) / (1024.0 * 1024.0)); }
 
 inline const char* resToString(HRESULT res)
 {
@@ -284,31 +298,29 @@ RWTexture2D<float4> gpu_rwtex_array[] : register(u1);
 RWTexture2D<float4> getSwapchainRT() { return gpu_rwtex_array[0]; }
 
 // Pointer type (matches GpuPtr on CPU)
-struct GpuPtr {
-	uint address;
+typedef uint GpuPtr;
 
-	uint loadByte()
-	{
-		const uint word_address = address & 0xFFFFFFFC;
-		const uint word = gpu_global_heap.Load<uint>(word_address);
-		const uint byte_address = address & 0x00000003;
-		const uint byte_shift = byte_address * 8;
-		const uint byte = (word >> byte_shift) & 0x000000FF;
-		return byte;
-	}
+uint ptrLoadByte(GpuPtr ptr)
+{
+	const uint word_address = ptr & 0xFFFFFFFC;
+	const uint word = gpu_global_heap.Load<uint>(word_address);
+	const uint byte_address = ptr & 0x00000003;
+	const uint byte_shift = byte_address * 8;
+	const uint byte = (word >> byte_shift) & 0x000000FF;
+	return byte;
+}
 
-	template<typename T>
-	T load() { return gpu_global_heap.Load<T>(address); }
+template<typename T>
+T ptrLoad(GpuPtr ptr) { return gpu_global_heap.Load<T>(ptr); }
 
-	template<typename T>
-	T loadArrayElem(uint idx) { return gpu_global_heap.Load<T>(address + idx * sizeof(T)); }
+template<typename T>
+T ptrLoadArrayElem(GpuPtr ptr, uint idx) { return gpu_global_heap.Load<T>(ptr + idx * sizeof(T)); }
 
-	template<typename T>
-	void store(T val) { gpu_global_heap.Store<T>(address, val); }
+template<typename T>
+void ptrStore(GpuPtr ptr, T val) { gpu_global_heap.Store<T>(ptr, val); }
 
-	template<typename T>
-	void storeArrayElem(T val, uint idx) { gpu_global_heap.Store<T>(address + idx * sizeof(T), val); }
-};
+template<typename T>
+void ptrStoreArrayElem(GpuPtr ptr, T val, uint idx) { gpu_global_heap.Store<T>(ptr + idx * sizeof(T), val); }
 
 )";
 

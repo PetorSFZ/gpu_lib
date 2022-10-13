@@ -51,6 +51,8 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 	GpuLibInitCfg cfg = *cfgIn;
 	cfg.gpu_heap_size_bytes = u32_clamp(cfg.gpu_heap_size_bytes, GPU_HEAP_MIN_SIZE, GPU_HEAP_MAX_SIZE);
 	cfg.max_num_textures_per_type = u32_clamp(cfg.max_num_textures_per_type, GPU_TEXTURES_MIN_NUM, GPU_TEXTURES_MAX_NUM);
+	cfg.upload_heap_size_bytes = sfzRoundUpAlignedU32(cfg.upload_heap_size_bytes, 256);
+	cfg.download_heap_size_bytes = sfzRoundUpAlignedU32(cfg.download_heap_size_bytes, 256);
 
 	// Enable debug layers in debug mode
 	if (cfg.debug_mode) {
@@ -140,15 +142,103 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 		desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 		desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
-		const D3D12_RESOURCE_STATES initial_res_state = D3D12_RESOURCE_STATE_COMMON;
-
 		const bool heap_success = CHECK_D3D12(device->CreateCommittedResource(
-			&heap_props, heap_flags, &desc, initial_res_state, nullptr, IID_PPV_ARGS(&gpu_heap)));
+			&heap_props, heap_flags, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&gpu_heap)));
 		if (!heap_success) {
 			printf("[gpu_lib]: Could not allocate gpu heap of size %.2f MiB, exiting.",
-				f32(cfg.gpu_heap_size_bytes) / (1024.0f * 1024.0f));
+				gpuPrintToMiB(cfg.gpu_heap_size_bytes));
 			return nullptr;
 		}
+	}
+
+	// Allocate upload heap
+	ComPtr<ID3D12Resource> upload_heap;
+	u8* upload_heap_mapped_ptr = nullptr; // Persistently mapped, never unmapped
+	{
+		D3D12_HEAP_PROPERTIES heap_props = {};
+		heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
+		heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+		heap_props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+		heap_props.CreationNodeMask = 0;
+		heap_props.VisibleNodeMask = 0;
+
+		D3D12_RESOURCE_DESC desc = {};
+		desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		desc.Alignment = 0;
+		desc.Width = cfg.upload_heap_size_bytes;
+		desc.Height = 1;
+		desc.DepthOrArraySize = 1;
+		desc.MipLevels = 1;
+		desc.Format = DXGI_FORMAT_UNKNOWN;
+		desc.SampleDesc.Count = 1;
+		desc.SampleDesc.Quality = 0;
+		desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		desc.Flags = D3D12_RESOURCE_FLAGS(0);
+
+		const bool heap_success = CHECK_D3D12(device->CreateCommittedResource(
+			&heap_props,
+			D3D12_HEAP_FLAG_CREATE_NOT_ZEROED,
+			&desc,
+			D3D12_RESOURCE_STATE_GENERIC_READ,
+			nullptr,
+			IID_PPV_ARGS(&upload_heap)));
+		if (!heap_success) {
+			printf("[gpu_lib]: Could not allocate upload heap of size %.2f MiB, exiting.",
+				gpuPrintToMiB(cfg.upload_heap_size_bytes));
+			return nullptr;
+		}
+
+		void* mapped_ptr = nullptr;
+		if (!CHECK_D3D12(upload_heap->Map(0, nullptr, &mapped_ptr))) {
+			printf("[gpu_lib]: Failed to map upload heap\n");
+			return nullptr;
+		}
+		upload_heap_mapped_ptr = static_cast<u8*>(mapped_ptr);
+	}
+
+	// Allocate download heap
+	ComPtr<ID3D12Resource> download_heap;
+	u8* download_heap_mapped_ptr = nullptr; // Persistently mapped, never unmapped
+	{
+		D3D12_HEAP_PROPERTIES heap_props = {};
+		heap_props.Type = D3D12_HEAP_TYPE_READBACK;
+		heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+		heap_props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+		heap_props.CreationNodeMask = 0;
+		heap_props.VisibleNodeMask = 0;
+
+		D3D12_RESOURCE_DESC desc = {};
+		desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		desc.Alignment = 0;
+		desc.Width = cfg.download_heap_size_bytes;
+		desc.Height = 1;
+		desc.DepthOrArraySize = 1;
+		desc.MipLevels = 1;
+		desc.Format = DXGI_FORMAT_UNKNOWN;
+		desc.SampleDesc.Count = 1;
+		desc.SampleDesc.Quality = 0;
+		desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		desc.Flags = D3D12_RESOURCE_FLAGS(0);
+
+		const bool heap_success = CHECK_D3D12(device->CreateCommittedResource(
+			&heap_props,
+			D3D12_HEAP_FLAG_CREATE_NOT_ZEROED,
+			&desc,
+			D3D12_RESOURCE_STATE_COPY_DEST,
+			nullptr,
+			IID_PPV_ARGS(&download_heap)));
+		if (!heap_success) {
+			printf("[gpu_lib]: Could not allocate download heap of size %.2f MiB, exiting.",
+				gpuPrintToMiB(cfg.download_heap_size_bytes));
+			return nullptr;
+		}
+
+		void* mapped_ptr = nullptr;
+		if (!CHECK_D3D12(download_heap->Map(0, nullptr, &mapped_ptr))) {
+			printf("[gpu_lib]: Failed to map download heap\n");
+			return nullptr;
+		}
+		download_heap_mapped_ptr = static_cast<u8*>(mapped_ptr);
 	}
 
 	// Create tex descriptor heap
@@ -318,7 +408,15 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 	gpu->info_queue = info_queue;
 
 	gpu->gpu_heap = gpu_heap;
+	gpu->gpu_heap_state = D3D12_RESOURCE_STATE_COMMON;
 	gpu->gpu_heap_next_free = GPU_HEAP_SYSTEM_RESERVED_SIZE;
+
+	gpu->upload_heap = upload_heap;
+	gpu->upload_heap_mapped_ptr = upload_heap_mapped_ptr;
+	gpu->upload_heap_head_offset = 0;
+
+	gpu->download_heap = download_heap;
+	gpu->download_heap_mapped_ptr = download_heap_mapped_ptr;
 
 	gpu->tex_descriptor_heap = tex_descriptor_heap;
 	gpu->num_tex_descriptors = num_tex_descriptors;
@@ -368,9 +466,9 @@ sfz_extern_c GpuPtr gpuMalloc(GpuLib* gpu, u32 num_bytes)
 
 	// Check if we have enough space left
 	const u32 end = gpu->gpu_heap_next_free + num_bytes;
-	if (gpu->cfg.gpu_heap_size_bytes > end) {
+	if (gpu->cfg.gpu_heap_size_bytes < end) {
 		printf("[gpu_lib]: Out of GPU memory, trying to allocate %.3f MiB.\n",
-			f32(num_bytes) / (1024.0f * 1024.0f));
+			gpuPrintToMiB(num_bytes));
 		return GPU_NULLPTR;
 	}
 
@@ -643,6 +741,52 @@ sfz_extern_c i32x3 gpuKernelGetGroupDims(const GpuLib* gpu, GpuKernel kernel)
 // Submission API
 // ------------------------------------------------------------------------------------------------
 
+sfz_extern_c void gpuQueueMemcpyUpload(GpuLib* gpu, GpuPtr dst, const void* src, u32 num_bytes_original)
+{
+	if (num_bytes_original == 0) return;
+	u32 num_bytes = sfzRoundUpAlignedU64(num_bytes_original, 256); // Only allocate 256-byte aligned ranges
+
+	// Try to allocate range in upload heap
+	u64 upload_heap_begin = gpu->upload_heap_head_offset;
+	u64 upload_heap_end = gpu->upload_heap_head_offset + num_bytes;
+	if (upload_heap_end > gpu->cfg.upload_heap_size_bytes) {
+		// Overflow, let's try allocating in beginning of upload heap instead
+		upload_heap_begin = 0;
+		upload_heap_end = num_bytes;
+	}
+
+	// TODO: Should actually check safe offsets
+	if (upload_heap_end > gpu->cfg.upload_heap_size_bytes) {
+		printf("[gpu_lib]: Can't memcpy upload %.2f MiB, upload heap is of size %.2f MiB\n",
+			gpuPrintToMiB(num_bytes), gpuPrintToMiB(gpu->cfg.upload_heap_size_bytes));
+		return;
+	}
+
+	// Memcpy data to upload heap and commit change
+	memcpy(gpu->upload_heap_mapped_ptr + upload_heap_begin, src, num_bytes_original);
+	gpu->upload_heap_head_offset = upload_heap_end;
+
+	// TODO: MUST ENSURE GLOBAL HEAP IS IN D3D12_RESOURCE_STATE_COPY_DEST
+	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
+	
+	// Ensure heap is in COPY_DEST state
+	if (gpu->gpu_heap_state != D3D12_RESOURCE_STATE_COPY_DEST) {
+		D3D12_RESOURCE_BARRIER barrier = {};
+		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+		barrier.Transition.pResource = gpu->gpu_heap.Get();
+		barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		barrier.Transition.StateBefore = gpu->gpu_heap_state;
+		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+		cmd_list_info.cmd_list->ResourceBarrier(1, &barrier);
+		gpu->gpu_heap_state = D3D12_RESOURCE_STATE_COPY_DEST;
+	}
+
+	// Copy to heap
+	cmd_list_info.cmd_list->CopyBufferRegion(
+		gpu->gpu_heap.Get(), dst, gpu->upload_heap.Get(), upload_heap_begin, num_bytes_original);
+}
+
 sfz_extern_c i32x2 gpuSwapchainGetRes(GpuLib* gpu)
 {
 	return gpu->swapchain_res;
@@ -652,6 +796,19 @@ sfz_extern_c void gpuQueueDispatch(
 	GpuLib* gpu, GpuKernel kernel, i32x3 num_groups, const void* params, u32 params_size)
 {
 	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
+
+	// Ensure heap is in UNORDERED_ACCESS state
+	if (gpu->gpu_heap_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+		D3D12_RESOURCE_BARRIER barrier = {};
+		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+		barrier.Transition.pResource = gpu->gpu_heap.Get();
+		barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		barrier.Transition.StateBefore = gpu->gpu_heap_state;
+		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+		cmd_list_info.cmd_list->ResourceBarrier(1, &barrier);
+		gpu->gpu_heap_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+	}
 
 	// Set kernel
 	const GpuKernelInfo* kernel_info = gpu->kernels.get(SfzHandle{ kernel.handle });
