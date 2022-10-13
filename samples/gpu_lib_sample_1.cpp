@@ -74,10 +74,6 @@ i32 main(i32 argc, char* argv[])
 	const GpuKernelDesc kernel_desc = GpuKernelDesc{
 		.name = "Test",
 		.path = "../../samples/gpu_lib_sample_1_kernel.hlsl",
-		.num_defines = 1,
-		.defines = {
-			"A_DEFINE"
-		}
 	};
 	const GpuKernel kernel = gpuKernelInit(gpu, &kernel_desc);
 	sfz_defer[=]() {
@@ -120,7 +116,6 @@ i32 main(i32 argc, char* argv[])
 		if (color.x > 1.0f) color.x -= 1.0f;
 		gpuQueueMemcpyUpload(gpu, color_ptr, &color, sizeof(color));
 
-		gpuQueueSwapchainBegin(gpu);
 		const i32x2 res = gpuSwapchainGetRes(gpu);
 		const i32x2 group_dims = gpuKernelGetGroupDims2(gpu, kernel);
 		const i32x2 num_groups = (res + group_dims - i32x2_splat(1)) / group_dims;
@@ -133,9 +128,8 @@ i32 main(i32 argc, char* argv[])
 		} params;
 		params.res = res;
 		params.color_ptr = color_ptr;
-		gpuQueueDispatch2(gpu, kernel, num_groups, GPU_LAUNCH_PARAMS(params));
+		gpuQueueDispatch(gpu, kernel, num_groups, params);
 
-		gpuQueueSwapchainEnd(gpu);
 		gpuSubmitQueuedWork(gpu);
 		gpuSwapchainPresent(gpu, true);
 	}

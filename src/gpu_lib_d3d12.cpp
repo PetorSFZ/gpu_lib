@@ -102,17 +102,11 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 	// Enable debug message in debug mode
 	ComPtr<ID3D12InfoQueue> info_queue;
 	if (cfg.debug_mode) {
-
 		if (!CHECK_D3D12(device->QueryInterface(IID_PPV_ARGS(&info_queue)))) {
 			return nullptr;
 		}
-
-		// Break on corruption and error messages
 		CHECK_D3D12(info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, TRUE));
 		CHECK_D3D12(info_queue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, TRUE));
-
-		// Log initial messages
-		logDebugMessages(info_queue.Get());
 	}
 
 	// Allocate our gpu heap
@@ -440,6 +434,9 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 	gpu->swapchain_res = i32x2_splat(0);
 	gpu->swapchain = swapchain;
 
+	// Do a quick present after initialization has finished, used to set up framebuffers
+	gpuSwapchainPresent(gpu, false);
+
 	return gpu;
 }
 
@@ -741,10 +738,15 @@ sfz_extern_c i32x3 gpuKernelGetGroupDims(const GpuLib* gpu, GpuKernel kernel)
 // Submission API
 // ------------------------------------------------------------------------------------------------
 
+sfz_extern_c i32x2 gpuSwapchainGetRes(GpuLib* gpu)
+{
+	return gpu->swapchain_res;
+}
+
 sfz_extern_c void gpuQueueMemcpyUpload(GpuLib* gpu, GpuPtr dst, const void* src, u32 num_bytes_original)
 {
 	if (num_bytes_original == 0) return;
-	u32 num_bytes = sfzRoundUpAlignedU64(num_bytes_original, 256); // Only allocate 256-byte aligned ranges
+	u32 num_bytes = sfzRoundUpAlignedU32(num_bytes_original, 256); // Only allocate 256-byte aligned ranges
 
 	// Try to allocate range in upload heap
 	u64 upload_heap_begin = gpu->upload_heap_head_offset;
@@ -785,11 +787,6 @@ sfz_extern_c void gpuQueueMemcpyUpload(GpuLib* gpu, GpuPtr dst, const void* src,
 	// Copy to heap
 	cmd_list_info.cmd_list->CopyBufferRegion(
 		gpu->gpu_heap.Get(), dst, gpu->upload_heap.Get(), upload_heap_begin, num_bytes_original);
-}
-
-sfz_extern_c i32x2 gpuSwapchainGetRes(GpuLib* gpu)
-{
-	return gpu->swapchain_res;
 }
 
 sfz_extern_c void gpuQueueDispatch(
@@ -842,9 +839,131 @@ sfz_extern_c void gpuQueueDispatch(
 	cmd_list_info.cmd_list->Dispatch(u32(num_groups.x), u32(num_groups.y), u32(num_groups.z));
 }
 
-sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu)
+sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu)
+{
+	// Copy contents from swapchain RT to actual swapchain
+	if (gpu->swapchain != nullptr) {
+		GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
+
+		// Grab current swapchain render target and descriptor heap
+		const u32 curr_swapchain_fb_idx = gpu->swapchain->GetCurrentBackBufferIndex();
+		sfz_assert(curr_swapchain_fb_idx < GPU_NUM_CMD_LISTS);
+		ComPtr<ID3D12Resource> render_target;
+		CHECK_D3D12(gpu->swapchain->GetBuffer(curr_swapchain_fb_idx, IID_PPV_ARGS(&render_target)));
+
+		// Barriers to transition swapchain rwtex to COPY_SOURCE and swapchain backing to COPY_DEST.
+		{
+			D3D12_RESOURCE_BARRIER barriers[2] = {};
+
+			barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			barriers[0].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+			barriers[0].Transition.pResource = gpu->swapchain_rt.Get();
+			barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+			barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+
+			barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			barriers[1].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+			barriers[1].Transition.pResource = render_target.Get();
+			barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+			barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+
+			cmd_list_info.cmd_list->ResourceBarrier(2, barriers);
+		}
+
+		// Copy contents of swapchain rt to actual backbuffer
+		cmd_list_info.cmd_list->CopyResource(render_target.Get(), gpu->swapchain_rt.Get());
+
+		// Barriers to transition swapchain rwtex to UNORDERED_ACCESS and swapchain backing to PRESENT.
+		{
+			D3D12_RESOURCE_BARRIER barriers[2] = {};
+
+			barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			barriers[0].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+			barriers[0].Transition.pResource = gpu->swapchain_rt.Get();
+			barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+			barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+
+			barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			barriers[1].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+			barriers[1].Transition.pResource = render_target.Get();
+			barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+			barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+
+			cmd_list_info.cmd_list->ResourceBarrier(2, barriers);
+		}
+	}
+
+	// Execute current command list
+	{
+		GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
+
+		// Close command list
+		if (!CHECK_D3D12(cmd_list_info.cmd_list->Close())) {
+			printf("[gpu_lib]: Could not close command list.\n");
+			return;
+		}
+
+		// Execute command list
+		ID3D12CommandList* cmd_lists[1] = {};
+		cmd_lists[0] = cmd_list_info.cmd_list.Get();
+		gpu->cmd_queue->ExecuteCommandLists(1, cmd_lists);
+
+		// Fence signalling
+		if (!CHECK_D3D12(gpu->cmd_queue->Signal(gpu->cmd_queue_fence.Get(), gpu->cmd_queue_fence_value))) {
+			printf("[gpu_lib]: Could not signal from command queue\n");
+			return;
+		}
+		// This command list is done once the value above is signalled
+		cmd_list_info.fence_value = gpu->cmd_queue_fence_value;
+		// Increment value we will signal next time
+		gpu->cmd_queue_fence_value += 1;
+	}
+
+	// Log current deubg messages
+	logDebugMessages(gpu->info_queue.Get());
+
+	// Switch to next command list
+	{
+		gpu->curr_cmd_list = (gpu->curr_cmd_list + 1) % GPU_NUM_CMD_LISTS;
+		GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
+
+		// Wait until command list is done
+		if (gpu->cmd_queue_fence->GetCompletedValue() < cmd_list_info.fence_value) {
+			CHECK_D3D12(gpu->cmd_queue_fence->SetEventOnCompletion(
+				cmd_list_info.fence_value, gpu->cmd_queue_fence_event));
+			WaitForSingleObject(gpu->cmd_queue_fence_event, INFINITE);
+		}
+
+		if (!CHECK_D3D12(cmd_list_info.cmd_allocator->Reset())) {
+			printf("[gpu_lib]: Couldn't reset command allocator\n");
+			return;
+		}
+		if (!CHECK_D3D12(cmd_list_info.cmd_list->Reset(cmd_list_info.cmd_allocator.Get(), nullptr))) {
+			printf("[gpu_lib]: Couldn't reset command list\n");
+			return;
+		}
+
+		// Set texture descriptor heap
+		ID3D12DescriptorHeap* heaps[] = { gpu->tex_descriptor_heap.Get() };
+		cmd_list_info.cmd_list->SetDescriptorHeaps(1, heaps);
+	}
+}
+
+sfz_extern_c void gpuSwapchainPresent(GpuLib* gpu, bool vsync)
 {
 	if (gpu->swapchain == nullptr) return;
+
+	// Present swapchain's render target
+	const u32 vsync_val = vsync ? 1 : 0; // Can specify 2-4 for vsync:ing on not every frame
+	const u32 flags = (!vsync && gpu->cfg.allow_tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+	if (!CHECK_D3D12(gpu->swapchain->Present(vsync_val, flags))) {
+		printf("[gpu_lib]: Present failure.\n");
+		return;
+	}
 
 	// Get current window resolution
 	i32x2 window_res = i32x2_splat(0);
@@ -942,128 +1061,6 @@ sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu)
 				gpu->tex_descriptor_heap_start_cpu.ptr + gpu->tex_descriptor_size * RWTEX_ARRAY_SWAPCHAIN_RT_IDX;
 			gpu->device->CreateUnorderedAccessView(gpu->swapchain_rt.Get(), nullptr, &uav_desc, cpu_descriptor);
 		}
-	}
-}
-
-sfz_extern_c void gpuQueueSwapchainEnd(GpuLib* gpu)
-{
-	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
-
-	// Grab current swapchain render target and descriptor heap
-	const u32 curr_swapchain_fb_idx = gpu->swapchain->GetCurrentBackBufferIndex();
-	sfz_assert(curr_swapchain_fb_idx < GPU_NUM_CMD_LISTS);
-	ComPtr<ID3D12Resource> render_target;
-	CHECK_D3D12(gpu->swapchain->GetBuffer(curr_swapchain_fb_idx, IID_PPV_ARGS(&render_target)));
-
-	// Barriers to transition swapchain rwtex to COPY_SOURCE and swapchain backing to COPY_DEST.
-	{
-		D3D12_RESOURCE_BARRIER barriers[2] = {};
-
-		barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		barriers[0].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-		barriers[0].Transition.pResource = gpu->swapchain_rt.Get();
-		barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-		barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-
-		barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		barriers[1].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-		barriers[1].Transition.pResource = render_target.Get();
-		barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-		barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-
-		cmd_list_info.cmd_list->ResourceBarrier(2, barriers);
-	}
-
-	// Copy contents of swapchain rt to actual backbuffer
-	cmd_list_info.cmd_list->CopyResource(render_target.Get(), gpu->swapchain_rt.Get());
-
-	// Barriers to transition swapchain rwtex to UNORDERED_ACCESS and swapchain backing to PRESENT.
-	{
-		D3D12_RESOURCE_BARRIER barriers[2] = {};
-
-		barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		barriers[0].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-		barriers[0].Transition.pResource = gpu->swapchain_rt.Get();
-		barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-		barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-
-		barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		barriers[1].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-		barriers[1].Transition.pResource = render_target.Get();
-		barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-		barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-
-		cmd_list_info.cmd_list->ResourceBarrier(2, barriers);
-	}
-}
-
-sfz_extern_c void gpuSwapchainPresent(GpuLib* gpu, bool vsync)
-{
-	// Present swapchain's render target
-	const u32 vsync_val = vsync ? 1 : 0; // Can specify 2-4 for vsync:ing on not every frame
-	const u32 flags = (!vsync && gpu->cfg.allow_tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
-	if (!CHECK_D3D12(gpu->swapchain->Present(vsync_val, flags))) {
-		printf("[gpu_lib]: Present failure.\n");
-		return;
-	}
-}
-
-sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu)
-{
-	// Execute current command list
-	{
-		GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
-
-		// Close command list
-		if (!CHECK_D3D12(cmd_list_info.cmd_list->Close())) {
-			printf("[gpu_lib]: Could not close command list.\n");
-			return;
-		}
-
-		// Execute command list
-		ID3D12CommandList* cmd_lists[1] = {};
-		cmd_lists[0] = cmd_list_info.cmd_list.Get();
-		gpu->cmd_queue->ExecuteCommandLists(1, cmd_lists);
-
-		// Fence signalling
-		if (!CHECK_D3D12(gpu->cmd_queue->Signal(gpu->cmd_queue_fence.Get(), gpu->cmd_queue_fence_value))) {
-			printf("[gpu_lib]: Could not signal from command queue\n");
-			return;
-		}
-		// This command list is done once the value above is signalled
-		cmd_list_info.fence_value = gpu->cmd_queue_fence_value;
-		// Increment value we will signal next time
-		gpu->cmd_queue_fence_value += 1;
-	}
-
-	// Switch to next command list
-	{
-		gpu->curr_cmd_list = (gpu->curr_cmd_list + 1) % GPU_NUM_CMD_LISTS;
-		GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
-
-		// Wait until command list is done
-		if (gpu->cmd_queue_fence->GetCompletedValue() < cmd_list_info.fence_value) {
-			CHECK_D3D12(gpu->cmd_queue_fence->SetEventOnCompletion(
-				cmd_list_info.fence_value, gpu->cmd_queue_fence_event));
-			WaitForSingleObject(gpu->cmd_queue_fence_event, INFINITE);
-		}
-
-		if (!CHECK_D3D12(cmd_list_info.cmd_allocator->Reset())) {
-			printf("[gpu_lib]: Couldn't reset command allocator\n");
-			return;
-		}
-		if (!CHECK_D3D12(cmd_list_info.cmd_list->Reset(cmd_list_info.cmd_allocator.Get(), nullptr))) {
-			printf("[gpu_lib]: Couldn't reset command list\n");
-			return;
-		}
-
-		// Set texture descriptor heap
-		ID3D12DescriptorHeap* heaps[] = { gpu->tex_descriptor_heap.Get() };
-		cmd_list_info.cmd_list->SetDescriptorHeaps(1, heaps);
 	}
 }
 

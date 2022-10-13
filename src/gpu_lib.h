@@ -4,6 +4,7 @@
 
 #include <sfz.h>
 
+
 // Constants
 // ------------------------------------------------------------------------------------------------
 
@@ -15,6 +16,7 @@ sfz_constant u32 GPU_TEXTURES_MAX_NUM = 16384;
 sfz_constant u32 GPU_LAUNCH_PARAMS_MAX_SIZE = sizeof(u32) * 12;
 sfz_constant u32 GPU_KERNEL_MAX_NUM_DEFINES = 8;
 sfz_constant u32 GPU_KERNEL_DEFINE_MAX_LEN = 48;
+
 
 // Init API
 // ------------------------------------------------------------------------------------------------
@@ -40,6 +42,7 @@ sfz_struct(GpuLibInitCfg) {
 sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfg);
 sfz_extern_c void gpuLibDestroy(GpuLib* gpu);
 
+
 // Memory API
 // ------------------------------------------------------------------------------------------------
 
@@ -48,6 +51,7 @@ sfz_constant GpuPtr GPU_NULLPTR = {};
 
 sfz_extern_c GpuPtr gpuMalloc(GpuLib* gpu, u32 num_bytes);
 sfz_extern_c void gpuFree(GpuLib* gpu, GpuPtr ptr);
+
 
 // Textures API
 // ------------------------------------------------------------------------------------------------
@@ -72,6 +76,7 @@ sfz_extern_c void gpuFree(GpuLib* gpu, GpuPtr ptr);
 struct GpuTex; // Read-only
 struct GpuRWTex; // Read-write
 
+
 // Kernel API
 // ------------------------------------------------------------------------------------------------
 
@@ -90,7 +95,7 @@ sfz_struct(GpuKernelDesc) {
 	const char* name;
 	const char* path;
 	u32 num_defines;
-	const char* defines[];
+	const char* const* defines;
 };
 
 sfz_extern_c GpuKernel gpuKernelInit(GpuLib* gpu, const GpuKernelDesc* desc);
@@ -110,38 +115,50 @@ inline i32 gpuKernelGetGroupDims1(const GpuLib* gpu, GpuKernel kernel)
 	return dims.x;
 }
 
+
 // Submission API
 // ------------------------------------------------------------------------------------------------
 
-sfz_extern_c void gpuQueueMemcpyUpload(GpuLib* gpu, GpuPtr dst, const void* src, u32 num_bytes);
+// Submission API is what you are primarily going to be using frame to frame. The functions are
+// ordered in approximately the order you are expected to call them per-frame.
 
 sfz_extern_c i32x2 gpuSwapchainGetRes(GpuLib* gpu);
+
+sfz_extern_c void gpuQueueMemcpyUpload(GpuLib* gpu, GpuPtr dst, const void* src, u32 num_bytes);
 
 sfz_extern_c void gpuQueueDispatch(
 	GpuLib* gpu, GpuKernel kernel, i32x3 num_groups, const void* params, u32 params_size);
 
-inline void gpuQueueDispatch2(
-	GpuLib* gpu, GpuKernel kernel, i32x2 num_groups, const void* params, u32 params_size)
-{
-	gpuQueueDispatch(gpu, kernel, i32x3_init2(num_groups, 1), params, params_size);
-}
-inline void gpuQueueDispatch1(
-	GpuLib* gpu, GpuKernel kernel, i32 num_groups, const void* params, u32 params_size)
-{
-	gpuQueueDispatch(gpu, kernel, i32x3_init(num_groups, 1, 1), params, params_size);
-}
+sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu);
+sfz_extern_c void gpuSwapchainPresent(GpuLib* gpu, bool vsync);
+sfz_extern_c void gpuFlush(GpuLib* gpu);
+
+
+// C++ helpers
+// ------------------------------------------------------------------------------------------------
+
+// These are C++ wrapped variant of random parts of the API to make it nicer to use in C++.
 
 #ifdef __cplusplus
-template<typename T> const T* gpuCppPointifier(const T& ref) { return &ref; }
-#define GPU_LAUNCH_PARAMS(expr) gpuCppPointifier((expr)), sizeof((expr))
-#define GPU_LAUNCH_NO_PARAMS 0, 0
-#endif // __cplusplus
 
-sfz_extern_c void gpuQueueSwapchainBegin(GpuLib* gpu);
-sfz_extern_c void gpuQueueSwapchainEnd(GpuLib* gpu);
-sfz_extern_c void gpuSwapchainPresent(GpuLib* gpu, bool vsync);
+template<typename T>
+inline void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32x3 num_groups, const T& params)
+{
+	gpuQueueDispatch(gpu, kernel, num_groups, &params, sizeof(T));
+}
 
-sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu);
-sfz_extern_c void gpuFlush(GpuLib* gpu);
+template<typename T>
+inline void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32x2 num_groups, const T& params)
+{
+	gpuQueueDispatch<T>(gpu, kernel, i32x3_init2(num_groups, 1), params);
+}
+
+template<typename T>
+inline void gpuQueueDispatch(GpuLib* gpu, GpuKernel kernel, i32 num_groups, const T& params)
+{
+	gpuQueueDispatch<T>(gpu, kernel, i32x3_init(num_groups, 1, 1), params);
+}
+
+#endif
 
 #endif // GPU_LIB_H
