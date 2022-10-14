@@ -20,6 +20,6 @@ void CSMain(
 	const i32x2 idx = dispatch_thread_idx.xy;
 	if (res.x <= idx.x || res.y <= idx.y) return;
 
-	RWTexture2D<f32x4> swapchain_rt = getSwapchainRT();
-	swapchain_rt[idx] = ptrLoad<float4>(color_ptr);
+	RWTexture2D<f32x4> swapchain_tex = getSwapchainRWTex();
+	swapchain_tex[idx] = ptrLoad<float4>(color_ptr);
 }

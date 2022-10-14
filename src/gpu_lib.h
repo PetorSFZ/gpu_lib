@@ -4,9 +4,13 @@
 
 #include <sfz.h>
 
-
 // Constants
 // ------------------------------------------------------------------------------------------------
+
+// This constant defines the number of command lists that can be in-flight at the same time. It's
+// important for synchronization, if you are downloading data from the GPU every frame you should
+// typically have a lag of this many frames before you get the data.
+sfz_constant u32 GPU_NUM_CONCURRENT_SUBMITS = 3;
 
 sfz_constant u32 GPU_HEAP_SYSTEM_RESERVED_SIZE = 8 * 1024 * 1024;
 sfz_constant u32 GPU_HEAP_MIN_SIZE = GPU_HEAP_SYSTEM_RESERVED_SIZE;
@@ -122,6 +126,9 @@ inline i32 gpuKernelGetGroupDims1(const GpuLib* gpu, GpuKernel kernel)
 
 // The Command API is what you are primarily going to be using frame to frame. The functions are
 // ordered in approximately the order you are expected to call them per-frame.
+
+// Returns the index of the current command list. Increments every gpuSubmitQueuedWork().
+sfz_extern_c u64 gpuGetCurrSubmitIdx(GpuLib* gpu);
 
 // Returns the current resolution of the swapchain (window) being rendered to.
 sfz_extern_c i32x2 gpuSwapchainGetRes(GpuLib* gpu);

@@ -107,12 +107,9 @@ i32 main(i32 argc, char* argv[])
 		initial_gpu_timestamp = gpuGetDownloadedData<u64>(gpu, ticket);
 	}
 
-	GpuTicket timestamp_tickets[3] = {};
-	u32 curr_timestamp_ticket = 0;
+	GpuTicket timestamp_tickets[GPU_NUM_CONCURRENT_SUBMITS] = {};
 	auto getCurrTimestampTicket = [&]() -> GpuTicket& {
-		GpuTicket& ticket = timestamp_tickets[curr_timestamp_ticket];
-		curr_timestamp_ticket = (curr_timestamp_ticket + 1) % 3;
-		return ticket;
+		return timestamp_tickets[gpuGetCurrSubmitIdx(gpu) % GPU_NUM_CONCURRENT_SUBMITS];
 	};
 
 	// Run our main loop

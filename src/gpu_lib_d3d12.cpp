@@ -133,8 +133,8 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 	}
 
 	// Create command lists
-	GpuCmdListInfo cmd_lists[GPU_NUM_CMD_LISTS];
-	for (u32 i = 0; i < GPU_NUM_CMD_LISTS; i++) {
+	GpuCmdListInfo cmd_lists[GPU_NUM_CONCURRENT_SUBMITS];
+	for (u32 i = 0; i < GPU_NUM_CONCURRENT_SUBMITS; i++) {
 		GpuCmdListInfo& info = cmd_lists[i];
 
 		if (!CHECK_D3D12(device->CreateCommandAllocator(
@@ -163,6 +163,7 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 		}
 
 		info.fence_value = 0;
+		info.submit_idx = 0;
 	}
 
 	// Create timestamp stuff
@@ -378,7 +379,7 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 			desc.Stereo = FALSE;
 			desc.SampleDesc = { 1, 0 }; // No MSAA
 			desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; // DXGI_USAGE_UNORDERED_ACCESS
-			desc.BufferCount = GPU_NUM_CMD_LISTS;
+			desc.BufferCount = GPU_NUM_CONCURRENT_SUBMITS;
 			desc.Scaling = DXGI_SCALING_STRETCH;
 			desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 			desc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
@@ -413,12 +414,13 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 	gpu->device = device;
 	gpu->info_queue = info_queue;
 
+	gpu->curr_submit_idx = 0;
+	gpu->known_completed_submit_idx = 0;
 	gpu->cmd_queue = cmd_queue;
 	gpu->cmd_queue_fence = cmd_queue_fence;
 	gpu->cmd_queue_fence_event = cmd_queue_fence_event;
 	gpu->cmd_queue_fence_value = 0;
-	for (u32 i = 0; i < GPU_NUM_CMD_LISTS; i++) gpu->cmd_lists[i] = cmd_lists[i];
-	gpu->curr_cmd_list = 0;
+	for (u32 i = 0; i < GPU_NUM_CONCURRENT_SUBMITS; i++) gpu->cmd_lists[i] = cmd_lists[i];
 
 	gpu->timestamp_query_heap = timestamp_query_heap;
 
@@ -757,6 +759,11 @@ sfz_extern_c i32x3 gpuKernelGetGroupDims(const GpuLib* gpu, GpuKernel kernel)
 // Command API
 // ------------------------------------------------------------------------------------------------
 
+sfz_extern_c u64 gpuGetCurrSubmitIdx(GpuLib* gpu)
+{
+	return gpu->curr_submit_idx;
+}
+
 sfz_extern_c i32x2 gpuSwapchainGetRes(GpuLib* gpu)
 {
 	return gpu->swapchain_res;
@@ -914,7 +921,7 @@ sfz_extern_c GpuTicket gpuQueueMemcpyDownload(GpuLib* gpu, GpuPtr src, u32 num_b
 	GpuPendingDownload& pending = *gpu->downloads.get(download_handle);
 	pending.heap_offset = u32(download_heap_begin);
 	pending.num_bytes = num_bytes;
-	// TODO: Synchronization (frame/submit number, fence idx, etc)
+	pending.submit_idx = gpu->curr_submit_idx;
 
 	const GpuTicket ticket = { download_handle.bits };
 	return ticket;
@@ -931,6 +938,10 @@ sfz_extern_c void gpuGetDownloadedData(GpuLib* gpu, GpuTicket ticket, void* dst,
 	if (pending->num_bytes != num_bytes) {
 		printf("[gpu_lib]: Memcpy download size mismatch, requested %u bytes, but %u was downloaded\n",
 			num_bytes, pending->num_bytes);
+		return;
+	}
+	if (gpu->known_completed_submit_idx < pending->submit_idx) {
+		printf("[gpu_lib]: Memcpy download is not yet done.\n");
 		return;
 	}
 	memcpy(dst, gpu->download_heap_mapped_ptr + pending->heap_offset, num_bytes);
@@ -990,12 +1001,12 @@ sfz_extern_c void gpuQueueDispatch(
 sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu)
 {
 	// Copy contents from swapchain RT to actual swapchain
-	if (gpu->swapchain != nullptr && gpu->swapchain_rt != nullptr) {
+	if (gpu->swapchain != nullptr && gpu->swapchain_rwtex != nullptr) {
 		GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
 
 		// Grab current swapchain render target and descriptor heap
 		const u32 curr_swapchain_fb_idx = gpu->swapchain->GetCurrentBackBufferIndex();
-		sfz_assert(curr_swapchain_fb_idx < GPU_NUM_CMD_LISTS);
+		sfz_assert(curr_swapchain_fb_idx < GPU_NUM_CONCURRENT_SUBMITS);
 		ComPtr<ID3D12Resource> render_target;
 		CHECK_D3D12(gpu->swapchain->GetBuffer(curr_swapchain_fb_idx, IID_PPV_ARGS(&render_target)));
 
@@ -1005,7 +1016,7 @@ sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu)
 
 			barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 			barriers[0].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-			barriers[0].Transition.pResource = gpu->swapchain_rt.Get();
+			barriers[0].Transition.pResource = gpu->swapchain_rwtex.Get();
 			barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 			barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 			barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -1021,7 +1032,7 @@ sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu)
 		}
 
 		// Copy contents of swapchain rt to actual backbuffer
-		cmd_list_info.cmd_list->CopyResource(render_target.Get(), gpu->swapchain_rt.Get());
+		cmd_list_info.cmd_list->CopyResource(render_target.Get(), gpu->swapchain_rwtex.Get());
 
 		// Barriers to transition swapchain rwtex to UNORDERED_ACCESS and swapchain backing to PRESENT.
 		{
@@ -1029,7 +1040,7 @@ sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu)
 
 			barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 			barriers[0].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-			barriers[0].Transition.pResource = gpu->swapchain_rt.Get();
+			barriers[0].Transition.pResource = gpu->swapchain_rwtex.Get();
 			barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 			barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
 			barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -1074,9 +1085,13 @@ sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu)
 	// Log current deubg messages
 	logDebugMessages(gpu->info_queue.Get());
 
-	// Switch to next command list
+	// Advance to next submit idx
 	{
-		gpu->curr_cmd_list = (gpu->curr_cmd_list + 1) % GPU_NUM_CMD_LISTS;
+		gpu->curr_submit_idx += 1;
+	}
+
+	// Start next command list
+	{
 		GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
 
 		// Wait until command list is done
@@ -1085,6 +1100,14 @@ sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu)
 				cmd_list_info.fence_value, gpu->cmd_queue_fence_event));
 			WaitForSingleObject(gpu->cmd_queue_fence_event, INFINITE);
 		}
+
+		// Now we know that the command list we just got has finished executing, thus we can set
+		// our known completed submit idx to the idx of the submit it was from.
+		gpu->known_completed_submit_idx =
+			u64_max(gpu->known_completed_submit_idx, cmd_list_info.submit_idx);
+
+		// Mark the new command list with the index of the current submit
+		cmd_list_info.submit_idx = gpu->curr_submit_idx;
 
 		if (!CHECK_D3D12(cmd_list_info.cmd_allocator->Reset())) {
 			printf("[gpu_lib]: Couldn't reset command allocator\n");
@@ -1133,7 +1156,7 @@ sfz_extern_c void gpuSwapchainPresent(GpuLib* gpu, bool vsync)
 	// Grab old swapchain resolution
 	DXGI_SWAP_CHAIN_DESC swapchain_desc = {};
 	CHECK_D3D12(gpu->swapchain->GetDesc(&swapchain_desc));
-	sfz_assert(swapchain_desc.BufferCount == GPU_NUM_CMD_LISTS);
+	sfz_assert(swapchain_desc.BufferCount == GPU_NUM_CONCURRENT_SUBMITS);
 	const i32x2 old_swapchain_res =
 		i32x2_init(swapchain_desc.BufferDesc.Width, swapchain_desc.BufferDesc.Height);
 	
@@ -1146,11 +1169,11 @@ sfz_extern_c void gpuSwapchainPresent(GpuLib* gpu, bool vsync)
 		gpuFlush(gpu);
 
 		// Release old swapchain RT
-		gpu->swapchain_rt.Reset();
+		gpu->swapchain_rwtex.Reset();
 
 		// Resize swapchain
 		if (!CHECK_D3D12(gpu->swapchain->ResizeBuffers(
-			GPU_NUM_CMD_LISTS,
+			GPU_NUM_CONCURRENT_SUBMITS,
 			u32(window_res.x),
 			u32(window_res.y),
 			swapchain_desc.BufferDesc.Format,
@@ -1188,13 +1211,13 @@ sfz_extern_c void gpuSwapchainPresent(GpuLib* gpu, bool vsync)
 				&desc,
 				D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 				nullptr,
-				IID_PPV_ARGS(&gpu->swapchain_rt)));
+				IID_PPV_ARGS(&gpu->swapchain_rwtex)));
 			if (!rt_success) {
 				printf("[gpu_lib]: Could not allocate swapchain render target of size %ix%i.\n",
 					window_res.x, window_res.y);
 				return;
 			}
-			setDebugName(gpu->swapchain_rt.Get(), "swapchain_rt");
+			setDebugName(gpu->swapchain_rwtex.Get(), "swapchain_rwtex");
 		}
 
 		// Set swapchain RT descriptor in tex descriptor heap
@@ -1208,7 +1231,7 @@ sfz_extern_c void gpuSwapchainPresent(GpuLib* gpu, bool vsync)
 			D3D12_CPU_DESCRIPTOR_HANDLE cpu_descriptor = {};
 			cpu_descriptor.ptr =
 				gpu->tex_descriptor_heap_start_cpu.ptr + gpu->tex_descriptor_size * RWTEX_ARRAY_SWAPCHAIN_RT_IDX;
-			gpu->device->CreateUnorderedAccessView(gpu->swapchain_rt.Get(), nullptr, &uav_desc, cpu_descriptor);
+			gpu->device->CreateUnorderedAccessView(gpu->swapchain_rwtex.Get(), nullptr, &uav_desc, cpu_descriptor);
 		}
 	}
 }
@@ -1222,4 +1245,8 @@ sfz_extern_c void gpuFlush(GpuLib* gpu)
 		WaitForSingleObject(gpu->cmd_queue_fence_event, INFINITE);
 	}
 	gpu->cmd_queue_fence_value += 1;
+
+	// Since we have flushed all submitted work, it stands to reason that it must have completed.
+	// Update known completed submit idx accordingly
+	gpu->known_completed_submit_idx = gpu->curr_submit_idx > 0 ? gpu->curr_submit_idx - 1 : 0;
 }

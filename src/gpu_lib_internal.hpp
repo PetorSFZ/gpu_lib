@@ -37,8 +37,6 @@ using Microsoft::WRL::ComPtr;
 
 sfz_constant u32 GPU_MALLOC_ALIGN = 64;
 
-sfz_constant u32 GPU_NUM_CMD_LISTS = 3;
-
 sfz_constant u32 GPU_ROOT_PARAM_GLOBAL_HEAP_IDX = 0;
 sfz_constant u32 GPU_ROOT_PARAM_RW_TEX_ARRAY_IDX = 1;
 sfz_constant u32 GPU_ROOT_PARAM_LAUNCH_PARAMS_IDX = 2;
@@ -49,6 +47,7 @@ sfz_struct(GpuCmdListInfo) {
 	ComPtr<ID3D12GraphicsCommandList> cmd_list;
 	ComPtr<ID3D12CommandAllocator> cmd_allocator;
 	u64 fence_value;
+	u64 submit_idx;
 };
 
 sfz_struct(GpuKernelInfo) {
@@ -61,6 +60,7 @@ sfz_struct(GpuKernelInfo) {
 sfz_struct(GpuPendingDownload) {
 	u32 heap_offset;
 	u32 num_bytes;
+	u64 submit_idx;
 };
 
 sfz_struct(GpuLib) {
@@ -72,13 +72,14 @@ sfz_struct(GpuLib) {
 	ComPtr<ID3D12InfoQueue> info_queue;
 
 	// Commands
+	u64 curr_submit_idx;
+	u64 known_completed_submit_idx;
 	ComPtr<ID3D12CommandQueue> cmd_queue;
 	ComPtr<ID3D12Fence> cmd_queue_fence;
 	HANDLE cmd_queue_fence_event;
 	u64 cmd_queue_fence_value;
-	GpuCmdListInfo cmd_lists[GPU_NUM_CMD_LISTS];
-	u32 curr_cmd_list;
-	GpuCmdListInfo& getCurrCmdList() { return cmd_lists[curr_cmd_list]; }
+	GpuCmdListInfo cmd_lists[GPU_NUM_CONCURRENT_SUBMITS];
+	GpuCmdListInfo& getCurrCmdList() { return cmd_lists[curr_submit_idx % GPU_NUM_CONCURRENT_SUBMITS]; }
 
 	// Timestamps
 	ComPtr<ID3D12QueryHeap> timestamp_query_heap;
@@ -92,9 +93,9 @@ sfz_struct(GpuLib) {
 	ComPtr<ID3D12Resource> upload_heap;
 	u8* upload_heap_mapped_ptr;
 	u64 upload_heap_head_offset;
-	//u64 upload_heap_safe_offsets[GPU_NUM_CMD_LISTS];
-	//u64& getCurrUploadHeapSafeOffset() { return upload_heap_safe_offsets[currCmdList]; }
-
+	//u32 upload_heap_safe_offsets[GPU_NUM_CONCURRENT_SUBMITS];
+	//u32& getCurrUploadHeapSafeOffset() { return upload_heap_safe_offsets[curr_submit_idx % GPU_NUM_CONCURRENT_SUBMITS]; }
+	
 	// Download heap
 	ComPtr<ID3D12Resource> download_heap;
 	u8* download_heap_mapped_ptr;
@@ -119,7 +120,7 @@ sfz_struct(GpuLib) {
 	// Swapchain
 	i32x2 swapchain_res;
 	ComPtr<IDXGISwapChain4> swapchain;
-	ComPtr<ID3D12Resource> swapchain_rt;
+	ComPtr<ID3D12Resource> swapchain_rwtex;
 };
 
 // Error handling
@@ -312,7 +313,8 @@ constexpr char GPU_KERNEL_PROLOG[] = R"(
 RWByteAddressBuffer gpu_global_heap : register(u0);
 RWTexture2D<float4> gpu_rwtex_array[] : register(u1);
 
-RWTexture2D<float4> getSwapchainRT() { return gpu_rwtex_array[0]; }
+RWTexture2D<float4> getSwapchainRWTex() { return gpu_rwtex_array[0]; }
+RWTexture2D<float4> getRWTex(uint idx) { return gpu_rwtex_array[NonUniformResourceIndex(idx)]; }
 
 // Pointer type (matches GpuPtr on CPU)
 typedef uint GpuPtr;
