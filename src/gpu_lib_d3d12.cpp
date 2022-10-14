@@ -51,8 +51,8 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 	GpuLibInitCfg cfg = *cfgIn;
 	cfg.gpu_heap_size_bytes = u32_clamp(cfg.gpu_heap_size_bytes, GPU_HEAP_MIN_SIZE, GPU_HEAP_MAX_SIZE);
 	cfg.max_num_textures_per_type = u32_clamp(cfg.max_num_textures_per_type, GPU_TEXTURES_MIN_NUM, GPU_TEXTURES_MAX_NUM);
-	cfg.upload_heap_size_bytes = sfzRoundUpAlignedU32(cfg.upload_heap_size_bytes, 256);
-	cfg.download_heap_size_bytes = sfzRoundUpAlignedU32(cfg.download_heap_size_bytes, 256);
+	cfg.upload_heap_size_bytes = sfzRoundUpAlignedU32(cfg.upload_heap_size_bytes, GPU_UPLOAD_HEAP_ALIGN);
+	cfg.download_heap_size_bytes = sfzRoundUpAlignedU32(cfg.download_heap_size_bytes, GPU_DOWNLOAD_HEAP_ALIGN);
 
 	// Enable debug layers in debug mode
 	if (cfg.debug_mode) {
@@ -164,6 +164,8 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 
 		info.fence_value = 0;
 		info.submit_idx = 0;
+		info.upload_heap_offset = 0;
+		info.download_heap_offset = 0;
 	}
 
 	// Create timestamp stuff
@@ -430,11 +432,13 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 
 	gpu->upload_heap = upload_heap;
 	gpu->upload_heap_mapped_ptr = upload_heap_mapped_ptr;
-	gpu->upload_heap_head_offset = 0;
+	gpu->upload_heap_offset = 0;
+	gpu->upload_heap_safe_offset = 0;
 
 	gpu->download_heap = download_heap;
 	gpu->download_heap_mapped_ptr = download_heap_mapped_ptr;
-	gpu->download_heap_head_offset = 0;
+	gpu->download_heap_offset = 0;
+	gpu->download_heap_safe_offset = 0;
 	gpu->downloads.init(cfg.max_num_concurrent_downloads, cfg.cpu_allocator, sfz_dbg("GpuLib::downloads"));
 
 	gpu->tex_descriptor_heap = tex_descriptor_heap;
@@ -455,6 +459,9 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 	// Do a quick present after initialization has finished, used to set up framebuffers
 	gpuSubmitQueuedWork(gpu);
 	gpuSwapchainPresent(gpu, false);
+	sfz_assert(gpu->curr_submit_idx == 1);
+	sfz_assert(gpu->upload_heap_safe_offset == gpu->cfg.upload_heap_size_bytes);
+	sfz_assert(gpu->download_heap_safe_offset == gpu->cfg.download_heap_size_bytes);
 
 	return gpu;
 }
@@ -821,32 +828,31 @@ sfz_extern_c void gpuQueueMemcpyUpload(GpuLib* gpu, GpuPtr dst, const void* src,
 		printf("[gpu_lib]: Trying to memcpy upload to an invalid pointer (%u)\n", dst);
 		return;
 	}
-	u32 num_bytes = sfzRoundUpAlignedU32(num_bytes_original, 256); // Only allocate 256-byte aligned ranges
+	const u32 num_bytes = sfzRoundUpAlignedU32(num_bytes_original, GPU_UPLOAD_HEAP_ALIGN);
 
-	// Try to allocate range in upload heap
-	u64 upload_heap_begin = gpu->upload_heap_head_offset;
-	u64 upload_heap_end = gpu->upload_heap_head_offset + num_bytes;
-	if (upload_heap_end > gpu->cfg.upload_heap_size_bytes) {
-		// Overflow, let's try allocating in beginning of upload heap instead
-		upload_heap_begin = 0;
-		upload_heap_end = num_bytes;
+	// Try to allocate a range
+	u64 begin = gpu->upload_heap_offset;
+	u64 begin_mapped = begin % gpu->cfg.upload_heap_size_bytes;
+	if (gpu->cfg.upload_heap_size_bytes < (begin_mapped + num_bytes)) {
+		// Wrap around, try in beginning of heap instead.
+		begin = sfzRoundUpAlignedU64(gpu->upload_heap_offset, gpu->cfg.upload_heap_size_bytes);
+		begin_mapped = 0;
 	}
-
-	// TODO: Should actually check safe offsets
-	if (upload_heap_end > gpu->cfg.upload_heap_size_bytes) {
-		printf("[gpu_lib]: Can't memcpy upload %.2f MiB, upload heap is of size %.2f MiB\n",
-			gpuPrintToMiB(num_bytes), gpuPrintToMiB(gpu->cfg.upload_heap_size_bytes));
+	const u64 end = begin + num_bytes;
+	
+	// Check for heap overflow
+	if (gpu->upload_heap_safe_offset <= end) {
+		printf("[gpu_lib]: Upload heap overflow by %u bytes\n",
+			u32(end - gpu->upload_heap_safe_offset));
 		return;
 	}
 
 	// Memcpy data to upload heap and commit change
-	memcpy(gpu->upload_heap_mapped_ptr + upload_heap_begin, src, num_bytes_original);
-	gpu->upload_heap_head_offset = upload_heap_end;
+	memcpy(gpu->upload_heap_mapped_ptr + begin_mapped, src, num_bytes_original);
+	gpu->upload_heap_offset = end;
 
-	// TODO: MUST ENSURE GLOBAL HEAP IS IN D3D12_RESOURCE_STATE_COPY_DEST
-	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
-	
 	// Ensure heap is in COPY_DEST state
+	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
 	if (gpu->gpu_heap_state != D3D12_RESOURCE_STATE_COPY_DEST) {
 		D3D12_RESOURCE_BARRIER barrier = {};
 		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -861,38 +867,40 @@ sfz_extern_c void gpuQueueMemcpyUpload(GpuLib* gpu, GpuPtr dst, const void* src,
 
 	// Copy to heap
 	cmd_list_info.cmd_list->CopyBufferRegion(
-		gpu->gpu_heap.Get(), dst, gpu->upload_heap.Get(), upload_heap_begin, num_bytes_original);
+		gpu->gpu_heap.Get(), dst, gpu->upload_heap.Get(), begin_mapped, num_bytes_original);
 }
 
-sfz_extern_c GpuTicket gpuQueueMemcpyDownload(GpuLib* gpu, GpuPtr src, u32 num_bytes)
+sfz_extern_c GpuTicket gpuQueueMemcpyDownload(GpuLib* gpu, GpuPtr src, u32 num_bytes_original)
 {
-	if (num_bytes == 0) return GPU_NULL_TICKET;
+	if (num_bytes_original == 0) return GPU_NULL_TICKET;
 	if (src < GPU_HEAP_SYSTEM_RESERVED_SIZE || gpu->cfg.gpu_heap_size_bytes <= src) {
 		printf("[gpu_lib]: Trying to memcpy download from an invalid pointer (%u)\n", src);
 		return GPU_NULL_TICKET;
 	}
+	const u32 num_bytes = sfzRoundUpAlignedU32(num_bytes_original, GPU_DOWNLOAD_HEAP_ALIGN);
 
-	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
-
-	// Try to allocate range in download heap
-	u64 download_heap_begin = gpu->download_heap_head_offset;
-	u64 download_heap_end = gpu->download_heap_head_offset + num_bytes;
-	if (download_heap_end > gpu->cfg.download_heap_size_bytes) {
-		// Overflow, let's try allocating in beginning of download heap instead
-		download_heap_begin = 0;
-		download_heap_end = num_bytes;
+	// Try to allocate a range
+	u64 begin = gpu->download_heap_offset;
+	u64 begin_mapped = begin % gpu->cfg.download_heap_size_bytes;
+	if (gpu->cfg.download_heap_size_bytes < (begin_mapped + num_bytes)) {
+		// Wrap around, try in beginning of heap instead.
+		begin = sfzRoundUpAlignedU64(gpu->download_heap_offset, gpu->cfg.download_heap_size_bytes);
+		begin_mapped = 0;
 	}
+	const u64 end = begin + num_bytes;
 
-	// TODO: Should actually check safe offsets
-	if (download_heap_end > gpu->cfg.download_heap_size_bytes) {
-		printf("[gpu_lib]: Can't memcpy download %.2f MiB, download heap is of size %.2f MiB\n",
-			gpuPrintToMiB(num_bytes), gpuPrintToMiB(gpu->cfg.download_heap_size_bytes));
+	// Check for heap overflow
+	if (gpu->download_heap_safe_offset <= end) {
+		printf("[gpu_lib]: Download heap overflow by %u bytes\n",
+			u32(end - gpu->download_heap_safe_offset));
 		return GPU_NULL_TICKET;
 	}
 
-	gpu->download_heap_head_offset = download_heap_end;
+	// Commit change
+	gpu->download_heap_offset = end;
 
 	// Ensure heap is in COPY_SOURCE state
+	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
 	if (gpu->gpu_heap_state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
 		D3D12_RESOURCE_BARRIER barrier = {};
 		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -907,7 +915,7 @@ sfz_extern_c GpuTicket gpuQueueMemcpyDownload(GpuLib* gpu, GpuPtr src, u32 num_b
 
 	// Copy to download heap
 	cmd_list_info.cmd_list->CopyBufferRegion(
-		gpu->download_heap.Get(), download_heap_begin, gpu->gpu_heap.Get(), src, num_bytes);
+		gpu->download_heap.Get(), begin_mapped, gpu->gpu_heap.Get(), src, num_bytes_original);
 
 	// Allocate a pending download slot
 	const SfzHandle download_handle = gpu->downloads.allocate();
@@ -919,8 +927,8 @@ sfz_extern_c GpuTicket gpuQueueMemcpyDownload(GpuLib* gpu, GpuPtr src, u32 num_b
 
 	// Store data for the pending download
 	GpuPendingDownload& pending = *gpu->downloads.get(download_handle);
-	pending.heap_offset = u32(download_heap_begin);
-	pending.num_bytes = num_bytes;
+	pending.heap_offset = u32(begin_mapped);
+	pending.num_bytes = num_bytes_original;
 	pending.submit_idx = gpu->curr_submit_idx;
 
 	const GpuTicket ticket = { download_handle.bits };
@@ -1060,6 +1068,10 @@ sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu)
 	{
 		GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
 
+		// Store current upload and download heap offsets
+		cmd_list_info.upload_heap_offset = gpu->upload_heap_offset;
+		cmd_list_info.download_heap_offset = gpu->download_heap_offset;
+
 		// Close command list
 		if (!CHECK_D3D12(cmd_list_info.cmd_list->Close())) {
 			printf("[gpu_lib]: Could not close command list.\n");
@@ -1105,6 +1117,13 @@ sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu)
 		// our known completed submit idx to the idx of the submit it was from.
 		gpu->known_completed_submit_idx =
 			u64_max(gpu->known_completed_submit_idx, cmd_list_info.submit_idx);
+
+		// Same applies to upload and download heap safe offsets. The safe offset is always + size
+		// of the heap in question to handle wrap around in logic.
+		gpu->upload_heap_safe_offset = u64_max(gpu->upload_heap_safe_offset, 
+			cmd_list_info.upload_heap_offset + gpu->cfg.upload_heap_size_bytes);
+		gpu->download_heap_safe_offset = u64_max(gpu->download_heap_safe_offset,
+			cmd_list_info.download_heap_offset + gpu->cfg.download_heap_size_bytes);
 
 		// Mark the new command list with the index of the current submit
 		cmd_list_info.submit_idx = gpu->curr_submit_idx;
@@ -1249,4 +1268,11 @@ sfz_extern_c void gpuFlush(GpuLib* gpu)
 	// Since we have flushed all submitted work, it stands to reason that it must have completed.
 	// Update known completed submit idx accordingly
 	gpu->known_completed_submit_idx = gpu->curr_submit_idx > 0 ? gpu->curr_submit_idx - 1 : 0;
+
+	// Same applies to upload and download heap safe offset. The safe offset is always + size of
+	// the heap in question to handle wrap around in logic.
+	gpu->upload_heap_safe_offset = u64_max(gpu->upload_heap_safe_offset,
+		gpu->getPrevCmdList().upload_heap_offset + gpu->cfg.upload_heap_size_bytes);
+	gpu->download_heap_safe_offset = u64_max(gpu->download_heap_safe_offset,
+		gpu->getPrevCmdList().download_heap_offset + gpu->cfg.download_heap_size_bytes);
 }

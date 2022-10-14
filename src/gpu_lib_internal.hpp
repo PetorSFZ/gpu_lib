@@ -36,6 +36,8 @@ using Microsoft::WRL::ComPtr;
 // ------------------------------------------------------------------------------------------------
 
 sfz_constant u32 GPU_MALLOC_ALIGN = 64;
+sfz_constant u32 GPU_UPLOAD_HEAP_ALIGN = 256;
+sfz_constant u32 GPU_DOWNLOAD_HEAP_ALIGN = 256;
 
 sfz_constant u32 GPU_ROOT_PARAM_GLOBAL_HEAP_IDX = 0;
 sfz_constant u32 GPU_ROOT_PARAM_RW_TEX_ARRAY_IDX = 1;
@@ -48,6 +50,8 @@ sfz_struct(GpuCmdListInfo) {
 	ComPtr<ID3D12CommandAllocator> cmd_allocator;
 	u64 fence_value;
 	u64 submit_idx;
+	u64 upload_heap_offset;
+	u64 download_heap_offset;
 };
 
 sfz_struct(GpuKernelInfo) {
@@ -79,6 +83,7 @@ sfz_struct(GpuLib) {
 	HANDLE cmd_queue_fence_event;
 	u64 cmd_queue_fence_value;
 	GpuCmdListInfo cmd_lists[GPU_NUM_CONCURRENT_SUBMITS];
+	GpuCmdListInfo& getPrevCmdList() { return cmd_lists[(curr_submit_idx > 0 ? curr_submit_idx - 1 : 0) % GPU_NUM_CONCURRENT_SUBMITS]; }
 	GpuCmdListInfo& getCurrCmdList() { return cmd_lists[curr_submit_idx % GPU_NUM_CONCURRENT_SUBMITS]; }
 
 	// Timestamps
@@ -92,14 +97,14 @@ sfz_struct(GpuLib) {
 	// Upload heap
 	ComPtr<ID3D12Resource> upload_heap;
 	u8* upload_heap_mapped_ptr;
-	u64 upload_heap_head_offset;
-	//u32 upload_heap_safe_offsets[GPU_NUM_CONCURRENT_SUBMITS];
-	//u32& getCurrUploadHeapSafeOffset() { return upload_heap_safe_offsets[curr_submit_idx % GPU_NUM_CONCURRENT_SUBMITS]; }
+	u64 upload_heap_offset;
+	u64 upload_heap_safe_offset;
 	
 	// Download heap
 	ComPtr<ID3D12Resource> download_heap;
 	u8* download_heap_mapped_ptr;
-	u64 download_heap_head_offset;
+	u64 download_heap_offset;
+	u64 download_heap_safe_offset;
 	sfz::Pool<GpuPendingDownload> downloads;
 
 	// RWTex descriptor heap

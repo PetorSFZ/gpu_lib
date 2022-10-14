@@ -182,6 +182,12 @@ sfz_extern_c void gpuFlush(GpuLib* gpu);
 #ifdef __cplusplus
 
 template<typename T>
+void gpuQueueMemcpyUpload(GpuLib* gpu, GpuPtr dst, const T& src_data)
+{
+	gpuQueueMemcpyUpload(gpu, dst, &src_data, sizeof(T));
+}
+
+template<typename T>
 T gpuGetDownloadedData(GpuLib* gpu, GpuTicket ticket)
 {
 	T tmp = {};

@@ -94,6 +94,12 @@ i32 main(i32 argc, char* argv[])
 		gpuFree(gpu, timestamp_ptr);
 	};
 
+	struct BigChunk {
+		u8 data[4096];
+	};
+	const GpuPtr big_chunk_ptr = gpuMalloc(gpu, sizeof(BigChunk));
+	sfz_assert(big_chunk_ptr != GPU_NULLPTR);
+
 	f32x4 color = f32x4_init(0.0f, 0.0f, 0.0f, 1.0f);
 
 	// Retrieve the initial gpu timestamp
@@ -110,6 +116,11 @@ i32 main(i32 argc, char* argv[])
 	GpuTicket timestamp_tickets[GPU_NUM_CONCURRENT_SUBMITS] = {};
 	auto getCurrTimestampTicket = [&]() -> GpuTicket& {
 		return timestamp_tickets[gpuGetCurrSubmitIdx(gpu) % GPU_NUM_CONCURRENT_SUBMITS];
+	};
+
+	GpuTicket big_chunk_tickets[GPU_NUM_CONCURRENT_SUBMITS] = {};
+	auto getCurrBigChunkTicket = [&]() -> GpuTicket& {
+		return big_chunk_tickets[gpuGetCurrSubmitIdx(gpu) % GPU_NUM_CONCURRENT_SUBMITS];
 	};
 
 	// Run our main loop
@@ -152,9 +163,20 @@ i32 main(i32 argc, char* argv[])
 		// Start timestamp download
 		timestamp_ticket = gpuQueueMemcpyDownload(gpu, timestamp_ptr, sizeof(u64));
 
+		BigChunk dummy_chunk = {};
+		gpuQueueMemcpyUpload(gpu, big_chunk_ptr, dummy_chunk);
+
+		// Grab big chunk ticket from our queue and check if the download is ready
+		GpuTicket& big_chunk_ticket = getCurrBigChunkTicket();
+		if (big_chunk_ticket != GPU_NULL_TICKET) {
+			const BigChunk dummy = gpuGetDownloadedData<BigChunk>(gpu, big_chunk_ticket);
+			big_chunk_ticket = GPU_NULL_TICKET;
+		}
+		big_chunk_ticket = gpuQueueMemcpyDownload(gpu, big_chunk_ptr, sizeof(BigChunk));
+
 		color.x += 0.01f;
 		if (color.x > 1.0f) color.x -= 1.0f;
-		gpuQueueMemcpyUpload(gpu, color_ptr, &color, sizeof(color));
+		gpuQueueMemcpyUpload(gpu, color_ptr, color);
 
 		const i32x2 res = gpuSwapchainGetRes(gpu);
 		const i32x2 group_dims = gpuKernelGetGroupDims2(gpu, kernel);
