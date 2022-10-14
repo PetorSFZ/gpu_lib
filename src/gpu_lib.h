@@ -163,6 +163,17 @@ sfz_extern_c void gpuGetDownloadedData(GpuLib* gpu, GpuTicket ticket, void* dst,
 sfz_extern_c void gpuQueueDispatch(
 	GpuLib* gpu, GpuKernel kernel, i32x3 num_groups, const void* params, u32 params_size);
 
+// Queues the insertion of an unordered access barrier for the gpu heap. Not doing this is
+// undefined behaviour if there are overlapping write-writes or read-writes (but not read-reads)
+// between dispatches. If you are unsure, just insert one after each gpuQueueDispatch().
+sfz_extern_c void gpuQueueGpuHeapBarrier(GpuLib* gpu);
+
+// Queues the insertion of an unordered access barrier for a specific RWTex (or for all of them).
+// Same rules applies as for gpu heap barriers, necessary for overlapping writes and read-writes,
+// but not for overlapping reads.
+sfz_extern_c void gpuQueueRWTexBarrier(GpuLib* gpu, u32 tex_idx);
+sfz_extern_c void gpuQueueRWTexBarriers(GpuLib* gpu);
+
 // Submits queued work to GPU and prepares to start recording more.
 sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu);
 

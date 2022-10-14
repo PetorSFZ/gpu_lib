@@ -1006,6 +1006,33 @@ sfz_extern_c void gpuQueueDispatch(
 	cmd_list_info.cmd_list->Dispatch(u32(num_groups.x), u32(num_groups.y), u32(num_groups.z));
 }
 
+sfz_extern_c void gpuQueueGpuHeapBarrier(GpuLib* gpu)
+{
+	if (gpu->gpu_heap_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+		printf("[gpu_lib]: Can't insert a gpu heap barrier it's in the wrong internal state\n");
+		return;
+	}
+	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
+	D3D12_RESOURCE_BARRIER barrier = {};
+	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+	barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+	barrier.UAV.pResource = gpu->gpu_heap.Get();
+	cmd_list_info.cmd_list->ResourceBarrier(1, &barrier);
+}
+
+sfz_extern_c void gpuQueueRWTexBarrier(GpuLib* gpu, u32 tex_idx)
+{
+	(void)gpu;
+	(void)tex_idx;
+	// TODO: Implement
+}
+
+sfz_extern_c void gpuQueueRWTexBarriers(GpuLib* gpu)
+{
+	(void)gpu;
+	// TODO: Implement
+}
+
 sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu)
 {
 	// Copy contents from swapchain RT to actual swapchain
