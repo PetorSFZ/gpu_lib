@@ -216,9 +216,22 @@ inline const char* formatToString(GpuFormat fmt)
 
 inline i32x2 calcRWTexTargetRes(i32x2 swapchain_res, const GpuRWTexDesc* desc)
 {
-	(void)swapchain_res;
-	sfz_assert(!desc->swapchain_relative);
-	return desc->fixed_res;
+	if (!desc->swapchain_relative) return desc->fixed_res;
+	i32x2 res = i32x2_splat(0);
+	if (desc->relative_fixed_height != 0) {
+		sfz_assert(0 < desc->relative_fixed_height && desc->relative_fixed_height <= 16384);
+		const f32 aspect = f32(swapchain_res.x) / f32(swapchain_res.y);
+		res.y = desc->relative_fixed_height;
+		res.x = i32(roundf(aspect * f32(res.y)));
+	}
+	else {
+		sfz_assert(0.0f < desc->relative_scale && desc->relative_scale <= 8.0f);
+		res.x = i32(roundf(desc->relative_scale * f32(swapchain_res.x)));
+		res.y = i32(roundf(desc->relative_scale * f32(swapchain_res.y)));
+	}
+	res.x = i32_max(res.x, 1);
+	res.y = i32_max(res.y, 1);
+	return res;
 }
 
 // Error handling

@@ -543,10 +543,14 @@ sfz_extern_c const char* gpuFormatToString(GpuFormat format)
 	return formatToString(format);
 }
 
-sfz_extern_c GpuRWTex gpuRWTexInit(GpuLib* gpu, const GpuRWTexDesc* desc)
+static GpuRWTex gpuRWTexInitInternal(GpuLib* gpu, const GpuRWTexDesc* desc, const SfzHandle* existing_handle = nullptr)
 {
 	if (desc->format == GPU_FORMAT_UNDEFINED) {
 		printf("[gpu_lib]: Must specify a valid texture format when creating an RWTex\n");
+		return GPU_NULL_RWTEX;
+	}
+	if (desc->swapchain_relative && desc->relative_fixed_height != 0 && desc->relative_scale != 0.0f) {
+		printf("[gpu_lib]: For swapchain relative textures either fixed height or scale MUST be 0.\n");
 		return GPU_NULL_RWTEX;
 	}
 
@@ -590,7 +594,13 @@ sfz_extern_c GpuRWTex gpuRWTexInit(GpuLib* gpu, const GpuRWTexDesc* desc)
 	}
 
 	// Allocate slot in rwtex array
-	const SfzHandle handle = gpu->rw_textures.allocate();
+	SfzHandle handle = SFZ_NULL_HANDLE;
+	if (existing_handle != nullptr) {
+		handle = *existing_handle;
+	}
+	else {
+		handle = gpu->rw_textures.allocate();
+	}
 	if (handle == SFZ_NULL_HANDLE) {
 		printf("[gpu_lib]: Could not allocate slot in GpuRWTex array, out of slots.\n");
 		return GPU_NULL_RWTEX;
@@ -620,6 +630,11 @@ sfz_extern_c GpuRWTex gpuRWTexInit(GpuLib* gpu, const GpuRWTexDesc* desc)
 	}
 
 	return tex_idx;
+}
+
+sfz_extern_c GpuRWTex gpuRWTexInit(GpuLib* gpu, const GpuRWTexDesc* desc)
+{
+	return gpuRWTexInitInternal(gpu, desc);
 }
 
 sfz_extern_c void gpuRWTexDestroy(GpuLib* gpu, GpuRWTex tex)
@@ -661,6 +676,62 @@ sfz_extern_c i32x2 gpuRWTexGetRes(const GpuLib* gpu, GpuRWTex tex)
 	const GpuRWTexInfo* tex_info = gpu->rw_textures.get(handle);
 	if (tex_info == nullptr) return i32x2_splat(0);
 	return tex_info->tex_res;
+}
+
+sfz_extern_c void gpuRWTexSetSwapchainRelativeScale(GpuLib* gpu, GpuRWTex tex, f32 scale)
+{
+	const SfzHandle handle = gpu->rw_textures.getHandle(tex);
+	const GpuRWTexInfo* tex_info = gpu->rw_textures.get(handle);
+	if (tex_info == nullptr) {
+		printf("[gpu_lib]: Trying to set relative scale of a texture that doesn't exist (%u).\n",
+			u32(tex));
+		return;
+	}
+	if (!tex_info->desc.swapchain_relative) {
+		printf("[gpu_lib]: Trying to set relative scale of a texture that is not swapchain relative (%u).\n",
+			u32(tex));
+		return;
+	}
+	
+	// Just return if we already have the correct scale
+	if (tex_info->desc.relative_scale == scale) return;
+
+	// Rebuild texture
+	// Need to copy desc to avoid potential aliasing issues
+	SfzStr96 name = tex_info->name;
+	GpuRWTexDesc desc = tex_info->desc;
+	desc.relative_fixed_height = 0;
+	desc.relative_scale = scale;
+	desc.name = name.str;
+	gpuRWTexInitInternal(gpu, &desc, &handle);
+}
+
+sfz_extern_c void gpuRWTexSetSwapchainRelativeFixedHeight(GpuLib* gpu, GpuRWTex tex, i32 height)
+{
+	const SfzHandle handle = gpu->rw_textures.getHandle(tex);
+	const GpuRWTexInfo* tex_info = gpu->rw_textures.get(handle);
+	if (tex_info == nullptr) {
+		printf("[gpu_lib]: Trying to set relative fixed height of a texture that doesn't exist (%u).\n",
+			u32(tex));
+		return;
+	}
+	if (!tex_info->desc.swapchain_relative) {
+		printf("[gpu_lib]: Trying to set relative fixed height of a texture that is not swapchain relative (%u).\n",
+			u32(tex));
+		return;
+	}
+
+	// Just return if we already have the correct fixed height
+	if (tex_info->desc.relative_fixed_height == height) return;
+
+	// Rebuild texture
+	// Need to copy desc to avoid potential aliasing issues
+	SfzStr96 name = tex_info->name;
+	GpuRWTexDesc desc = tex_info->desc;
+	desc.relative_fixed_height = height;
+	desc.relative_scale = 0.0f;
+	desc.name = name.str;
+	gpuRWTexInitInternal(gpu, &desc, &handle);
 }
 
 // Kernel API
@@ -1459,6 +1530,26 @@ sfz_extern_c void gpuSwapchainPresent(GpuLib* gpu, bool vsync)
 			cpu_descriptor.ptr =
 				gpu->tex_descriptor_heap_start_cpu.ptr + gpu->tex_descriptor_size * RWTEX_SWAPCHAIN_IDX;
 			gpu->device->CreateUnorderedAccessView(gpu->swapchain_rwtex.Get(), nullptr, &uav_desc, cpu_descriptor);
+		}
+
+		// Rebuild all swapchain relative GpuRWTex
+		GpuRWTexInfo* tex_infos = gpu->rw_textures.data();
+		const sfz::PoolSlot* tex_slots = gpu->rw_textures.slots();
+		const u32 tex_array_size = gpu->rw_textures.arraySize();
+		for (u32 idx = RWTEX_SWAPCHAIN_IDX + 1; idx < tex_array_size; idx++) {
+			const sfz::PoolSlot slot = tex_slots[idx];
+			if (!slot.active()) continue;
+			GpuRWTexInfo& tex_info = tex_infos[idx];
+			if (!tex_info.desc.swapchain_relative) continue;
+			const SfzHandle tex_handle = gpu->rw_textures.getHandle(idx);
+			sfz_assert(tex_handle != SFZ_NULL_HANDLE);
+
+			// Rebuild texture
+			// Need to copy desc to avoid potential aliasing issues
+			SfzStr96 name = tex_info.name;
+			GpuRWTexDesc desc = tex_info.desc;
+			desc.name = name.str;
+			gpuRWTexInitInternal(gpu, &desc, &tex_handle);
 		}
 	}
 }

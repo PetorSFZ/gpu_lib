@@ -30,7 +30,7 @@ i32 main(i32 argc, char* argv[])
 	SDL_Window* window = SDL_CreateWindow(
 		"[gpu_lib] Sample 1",
 		SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-		800, 800,
+		1280, 720,
 		SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE);
 	if (window == NULL) {
 		printf("SDL_CreateWindow() failed: %s\n", SDL_GetError());
@@ -129,7 +129,9 @@ i32 main(i32 argc, char* argv[])
 			.name = "TestTexture",
 			.format = GPU_FORMAT_RGBA_F16,
 			.fixed_res = i32x2_init(128, 128),
-			.swapchain_relative = false
+			.swapchain_relative = true,
+			//.relative_fixed_height = 100
+			.relative_scale = 0.5f
 		};
 		tex = gpuRWTexInit(gpu, &tex_desc);
 		sfz_assert(tex != GPU_NULL_RWTEX);

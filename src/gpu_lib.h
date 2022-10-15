@@ -119,6 +119,11 @@ sfz_extern_c void gpuRWTexDestroy(GpuLib* gpu, GpuRWTex tex);
 sfz_extern_c const GpuRWTexDesc* gpuRWTexGetDesc(const GpuLib* gpu, GpuRWTex tex);
 sfz_extern_c i32x2 gpuRWTexGetRes(const GpuLib* gpu, GpuRWTex tex);
 
+// Changes size of a swapchain relative GpuRWTex.
+sfz_extern_c void gpuRWTexSetSwapchainRelativeScale(GpuLib* gpu, GpuRWTex tex, f32 scale);
+sfz_extern_c void gpuRWTexSetSwapchainRelativeFixedHeight(GpuLib* gpu, GpuRWTex tex, i32 height);
+
+
 // Unfortunately we probably do need textures. But maybe we can limit to:
 // * 2D only
 // * Two separate types, read-only and read-write
