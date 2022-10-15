@@ -1,3 +1,4 @@
+typedef uint16_t u16;
 typedef int i32;
 typedef int2 i32x2;
 typedef int3 i32x3;
@@ -7,7 +8,8 @@ typedef float4 f32x4;
 cbuffer LaunchParams : register(b0) {
 	i32x2 res;
 	GpuPtr color_ptr;
-	i32 padding;
+	GpuRWTex tex_idx;
+	u16 padding;
 }
 
 [numthreads(16, 16, 1)]
@@ -20,6 +22,13 @@ void CSMain(
 	const i32x2 idx = dispatch_thread_idx.xy;
 	if (res.x <= idx.x || res.y <= idx.y) return;
 
+	i32x2 tex_res = i32x2(0, 0);
+	RWTexture2D<f32x4> tex = getRWTex(tex_idx, tex_res);
 	RWTexture2D<f32x4> swapchain_tex = getSwapchainRWTex();
-	swapchain_tex[idx] = ptrLoad<float4>(color_ptr);
+	if (idx.x < tex_res.x && idx.y < tex_res.y) {
+		swapchain_tex[idx] = tex[idx];
+	}
+	else {
+		swapchain_tex[idx] = ptrLoad<float4>(color_ptr);
+	}
 }

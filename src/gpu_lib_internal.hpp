@@ -8,7 +8,9 @@
 
 #include <sfz_cpp.hpp>
 #include <sfz_defer.hpp>
+#include <skipifzero_arrays.hpp>
 #include <skipifzero_pool.hpp>
+#include <skipifzero_strings.hpp>
 
 // Windows.h
 #pragma warning(push, 0)
@@ -43,7 +45,7 @@ sfz_constant u32 GPU_ROOT_PARAM_GLOBAL_HEAP_IDX = 0;
 sfz_constant u32 GPU_ROOT_PARAM_RW_TEX_ARRAY_IDX = 1;
 sfz_constant u32 GPU_ROOT_PARAM_LAUNCH_PARAMS_IDX = 2;
 
-sfz_constant u32 RWTEX_ARRAY_SWAPCHAIN_RT_IDX = 0;
+sfz_constant u32 RWTEX_SWAPCHAIN_IDX = 1;
 
 sfz_struct(GpuCmdListInfo) {
 	ComPtr<ID3D12GraphicsCommandList> cmd_list;
@@ -54,17 +56,24 @@ sfz_struct(GpuCmdListInfo) {
 	u64 download_heap_offset;
 };
 
-sfz_struct(GpuKernelInfo) {
-	ComPtr<ID3D12PipelineState> pso;
-	ComPtr<ID3D12RootSignature> root_sig;
-	i32x3 group_dims;
-	u32 launch_params_size;
+sfz_struct(GpuRWTexInfo) {
+	ComPtr<ID3D12Resource> tex;
+	i32x2 tex_res;
+	GpuRWTexDesc desc;
+	SfzStr96 name;
 };
 
 sfz_struct(GpuPendingDownload) {
 	u32 heap_offset;
 	u32 num_bytes;
 	u64 submit_idx;
+};
+
+sfz_struct(GpuKernelInfo) {
+	ComPtr<ID3D12PipelineState> pso;
+	ComPtr<ID3D12RootSignature> root_sig;
+	i32x3 group_dims;
+	u32 launch_params_size;
 };
 
 sfz_struct(GpuLib) {
@@ -114,6 +123,9 @@ sfz_struct(GpuLib) {
 	D3D12_CPU_DESCRIPTOR_HANDLE tex_descriptor_heap_start_cpu;
 	D3D12_GPU_DESCRIPTOR_HANDLE tex_descriptor_heap_start_gpu;
 
+	// Textures
+	sfz::Pool<GpuRWTexInfo> rw_textures;
+
 	// DXC compiler
 	ComPtr<IDxcUtils> dxc_utils; // Not thread-safe
 	ComPtr<IDxcCompiler3> dxc_compiler; // Not thread-safe
@@ -126,7 +138,88 @@ sfz_struct(GpuLib) {
 	i32x2 swapchain_res;
 	ComPtr<IDXGISwapChain4> swapchain;
 	ComPtr<ID3D12Resource> swapchain_rwtex;
+
+	// Tmp barriers
+	SfzArray<D3D12_RESOURCE_BARRIER> tmp_barriers;
 };
+
+// Texture helpers
+// ------------------------------------------------------------------------------------------------
+
+inline DXGI_FORMAT formatToD3D12(GpuFormat fmt)
+{
+	switch (fmt) {
+	case GPU_FORMAT_R_U8_UNORM: return DXGI_FORMAT_R8_UNORM;
+	case GPU_FORMAT_RG_U8_UNORM: return DXGI_FORMAT_R8G8_UNORM;
+	case GPU_FORMAT_RGBA_U8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM;
+
+	case GPU_FORMAT_R_U8: return DXGI_FORMAT_R8_UINT;
+	case GPU_FORMAT_RG_U8: return DXGI_FORMAT_R8G8_UINT;
+	case GPU_FORMAT_RGBA_U8: return DXGI_FORMAT_R8G8B8A8_UINT;
+
+	case GPU_FORMAT_R_U16: return DXGI_FORMAT_R16_UINT;
+	case GPU_FORMAT_RG_U16: return DXGI_FORMAT_R16G16_UINT;
+	case GPU_FORMAT_RGBA_U16: return DXGI_FORMAT_R16G16B16A16_UINT;
+
+	case GPU_FORMAT_R_I32: return DXGI_FORMAT_R32_SINT;
+	case GPU_FORMAT_RG_I32: return DXGI_FORMAT_R32G32_SINT;
+	case GPU_FORMAT_RGBA_I32: return DXGI_FORMAT_R32G32B32A32_SINT;
+
+	case GPU_FORMAT_R_F16: return DXGI_FORMAT_R16_FLOAT;
+	case GPU_FORMAT_RG_F16: return DXGI_FORMAT_R16G16_FLOAT;
+	case GPU_FORMAT_RGBA_F16: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+
+	case GPU_FORMAT_R_F32: return DXGI_FORMAT_R32_FLOAT;
+	case GPU_FORMAT_RG_F32: return DXGI_FORMAT_R32G32_FLOAT;
+	case GPU_FORMAT_RGBA_F32: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+
+	default: break;
+	}
+	sfz_assert(false);
+	return DXGI_FORMAT_UNKNOWN;
+}
+
+inline const char* formatToString(GpuFormat fmt)
+{
+	switch (fmt) {
+	case GPU_FORMAT_UNDEFINED: return "GPU_FORMAT_UNDEFINED";
+
+	case GPU_FORMAT_R_U8_UNORM: return "GPU_FORMAT_R_U8_UNORM";
+	case GPU_FORMAT_RG_U8_UNORM: return "GPU_FORMAT_RG_U8_UNORM";
+	case GPU_FORMAT_RGBA_U8_UNORM: return "GPU_FORMAT_RGBA_U8_UNORM";
+
+	case GPU_FORMAT_R_U8: return "GPU_FORMAT_R_U8";
+	case GPU_FORMAT_RG_U8: return "GPU_FORMAT_RG_U8";
+	case GPU_FORMAT_RGBA_U8: return "GPU_FORMAT_RGBA_U8";
+
+	case GPU_FORMAT_R_U16: return "GPU_FORMAT_R_U16";
+	case GPU_FORMAT_RG_U16: return "GPU_FORMAT_RG_U16";
+	case GPU_FORMAT_RGBA_U16: return "GPU_FORMAT_RGBA_U16";
+
+	case GPU_FORMAT_R_I32: return "GPU_FORMAT_R_I32";
+	case GPU_FORMAT_RG_I32: return "GPU_FORMAT_RG_I32";
+	case GPU_FORMAT_RGBA_I32: return "GPU_FORMAT_RGBA_I32";
+
+	case GPU_FORMAT_R_F16: return "GPU_FORMAT_R_F16";
+	case GPU_FORMAT_RG_F16: return "GPU_FORMAT_RG_F16";
+	case GPU_FORMAT_RGBA_F16: return "GPU_FORMAT_RGBA_F16";
+
+	case GPU_FORMAT_R_F32: return "GPU_FORMAT_R_F32";
+	case GPU_FORMAT_RG_F32: return "GPU_FORMAT_RG_F32";
+	case GPU_FORMAT_RGBA_F32: return "GPU_FORMAT_RGBA_F32";
+
+	default: break;
+	}
+	sfz_assert(false);
+	return "UNKNOWN";
+}
+
+inline i32x2 calcRWTexTargetRes(i32x2 swapchain_res, const GpuRWTexDesc* desc)
+{
+	(void)swapchain_res;
+	sfz_assert(!desc->swapchain_relative);
+	return desc->fixed_res;
+}
 
 // Error handling
 // ------------------------------------------------------------------------------------------------
@@ -314,15 +407,32 @@ constexpr char GPU_KERNEL_PROLOG[] = R"(
 #define GPU_LIB
 #define GPU_HLSL
 
+// Other macros and constants
+#define static_assert(cond, msg) _Static_assert((cond), (msg))
+
 // Root signature
 RWByteAddressBuffer gpu_global_heap : register(u0);
 RWTexture2D<float4> gpu_rwtex_array[] : register(u1);
 
-RWTexture2D<float4> getSwapchainRWTex() { return gpu_rwtex_array[0]; }
-RWTexture2D<float4> getRWTex(uint idx) { return gpu_rwtex_array[NonUniformResourceIndex(idx)]; }
+// Textures
+typedef uint16_t GpuRWTex;
+static const GpuRWTex GPU_NULL_RWTEX = 0;
+static const GpuRWTex RWTEX_SWAPCHAIN_IDX = 1;
+
+RWTexture2D<float4> getSwapchainRWTex() { return gpu_rwtex_array[RWTEX_SWAPCHAIN_IDX]; }
+RWTexture2D<float4> getRWTex(GpuRWTex idx) { return gpu_rwtex_array[NonUniformResourceIndex(idx)]; }
+RWTexture2D<float4> getRWTex(GpuRWTex idx, out int2 tex_res)
+{
+	RWTexture2D<float4> tex = getRWTex(idx);
+	uint w = 0, h = 0;
+	tex.GetDimensions(w, h);
+	tex_res = int2(w, h);
+	return tex;
+}
 
 // Pointer type (matches GpuPtr on CPU)
 typedef uint GpuPtr;
+static const GpuPtr GPU_NULLPTR = 0;
 
 uint ptrLoadByte(GpuPtr ptr)
 {

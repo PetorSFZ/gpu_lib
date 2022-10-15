@@ -15,7 +15,7 @@ sfz_constant u32 GPU_NUM_CONCURRENT_SUBMITS = 3;
 sfz_constant u32 GPU_HEAP_SYSTEM_RESERVED_SIZE = 8 * 1024 * 1024;
 sfz_constant u32 GPU_HEAP_MIN_SIZE = GPU_HEAP_SYSTEM_RESERVED_SIZE;
 sfz_constant u32 GPU_HEAP_MAX_SIZE = U32_MAX;
-sfz_constant u32 GPU_TEXTURES_MIN_NUM = 1;
+sfz_constant u32 GPU_TEXTURES_MIN_NUM = 2;
 sfz_constant u32 GPU_TEXTURES_MAX_NUM = 16384;
 sfz_constant u32 GPU_LAUNCH_PARAMS_MAX_SIZE = sizeof(u32) * 12;
 sfz_constant u32 GPU_KERNEL_MAX_NUM_DEFINES = 8;
@@ -52,7 +52,7 @@ sfz_extern_c void gpuLibDestroy(GpuLib* gpu);
 // ------------------------------------------------------------------------------------------------
 
 typedef u32 GpuPtr;
-sfz_constant GpuPtr GPU_NULLPTR = {};
+sfz_constant GpuPtr GPU_NULLPTR = 0;
 
 sfz_extern_c GpuPtr gpuMalloc(GpuLib* gpu, u32 num_bytes);
 sfz_extern_c void gpuFree(GpuLib* gpu, GpuPtr ptr);
@@ -60,6 +60,64 @@ sfz_extern_c void gpuFree(GpuLib* gpu, GpuPtr ptr);
 
 // Textures API
 // ------------------------------------------------------------------------------------------------
+
+// A GpuRWTex is an index to a read-write:able texture in the textures array. Similarly to GpuPtr
+// it can freely be copied to GPU and used to bindlessly access the texture it represents.
+typedef u16 GpuRWTex;
+sfz_constant GpuRWTex GPU_NULL_RWTEX = 0;
+
+typedef enum {
+	GPU_FORMAT_UNDEFINED = 0,
+
+	GPU_FORMAT_R_U8_UNORM, // Normalized between [0, 1]
+	GPU_FORMAT_RG_U8_UNORM, // Normalized between [0, 1]
+	GPU_FORMAT_RGBA_U8_UNORM, // Normalized between [0, 1]
+
+	GPU_FORMAT_R_U8,
+	GPU_FORMAT_RG_U8,
+	GPU_FORMAT_RGBA_U8,
+
+	GPU_FORMAT_R_U16,
+	GPU_FORMAT_RG_U16,
+	GPU_FORMAT_RGBA_U16,
+
+	GPU_FORMAT_R_I32,
+	GPU_FORMAT_RG_I32,
+	GPU_FORMAT_RGBA_I32,
+
+	GPU_FORMAT_R_F16,
+	GPU_FORMAT_RG_F16,
+	GPU_FORMAT_RGBA_F16,
+
+	GPU_FORMAT_R_F32,
+	GPU_FORMAT_RG_F32,
+	GPU_FORMAT_RGBA_F32,
+
+	GPU_FORMAT_FORCE_I32 = I32_MAX
+} GpuFormat;
+
+sfz_extern_c const char* gpuFormatToString(GpuFormat format);
+
+sfz_struct(GpuRWTexDesc) {
+	const char* name;
+	GpuFormat format;
+
+	// Resolution of this texture if it is not swapchain relative
+	i32x2 fixed_res;
+
+	// If the texture is swapchain relative it will be reallocated whenever the swapchain changes
+	// resolution. The parameters below starting with "relative_" are used to determine what the
+	// resolution should be relative to the swapchain.
+	bool swapchain_relative;
+	i32 relative_fixed_height;
+	f32 relative_scale;
+};
+
+sfz_extern_c GpuRWTex gpuRWTexInit(GpuLib* gpu, const GpuRWTexDesc* desc);
+sfz_extern_c void gpuRWTexDestroy(GpuLib* gpu, GpuRWTex tex);
+
+sfz_extern_c const GpuRWTexDesc* gpuRWTexGetDesc(const GpuLib* gpu, GpuRWTex tex);
+sfz_extern_c i32x2 gpuRWTexGetRes(const GpuLib* gpu, GpuRWTex tex);
 
 // Unfortunately we probably do need textures. But maybe we can limit to:
 // * 2D only
@@ -78,8 +136,7 @@ sfz_extern_c void gpuFree(GpuLib* gpu, GpuPtr ptr);
 // * Only power of two for read-only textures (because mipmaps)
 // * Maybe can have a very limited selection of texture formats
 
-struct GpuTex; // Read-only
-struct GpuRWTex; // Read-write
+struct GpuROTex; // Read-only
 
 
 // Kernel API
@@ -128,13 +185,13 @@ inline i32 gpuKernelGetGroupDims1(const GpuLib* gpu, GpuKernel kernel)
 // ordered in approximately the order you are expected to call them per-frame.
 
 // Returns the index of the current command list. Increments every gpuSubmitQueuedWork().
-sfz_extern_c u64 gpuGetCurrSubmitIdx(GpuLib* gpu);
+sfz_extern_c u64 gpuGetCurrSubmitIdx(const GpuLib* gpu);
 
 // Returns the current resolution of the swapchain (window) being rendered to.
-sfz_extern_c i32x2 gpuSwapchainGetRes(GpuLib* gpu);
+sfz_extern_c i32x2 gpuSwapchainGetRes(const GpuLib* gpu);
 
 // Returns the number of ticks per second (i.e. frequency) of the gpu timestamps.
-sfz_extern_c u64 gpuTimestampGetFreq(GpuLib* gpu);
+sfz_extern_c u64 gpuTimestampGetFreq(const GpuLib* gpu);
 
 // Takes a timestamp and stores it in the u64 pointed to in the global heap.
 sfz_extern_c void gpuQueueTakeTimestamp(GpuLib* gpu, GpuPtr dst);
@@ -171,7 +228,7 @@ sfz_extern_c void gpuQueueGpuHeapBarrier(GpuLib* gpu);
 // Queues the insertion of an unordered access barrier for a specific RWTex (or for all of them).
 // Same rules applies as for gpu heap barriers, necessary for overlapping writes and read-writes,
 // but not for overlapping reads.
-sfz_extern_c void gpuQueueRWTexBarrier(GpuLib* gpu, u32 tex_idx);
+sfz_extern_c void gpuQueueRWTexBarrier(GpuLib* gpu, GpuRWTex tex_idx);
 sfz_extern_c void gpuQueueRWTexBarriers(GpuLib* gpu);
 
 // Submits queued work to GPU and prepares to start recording more.

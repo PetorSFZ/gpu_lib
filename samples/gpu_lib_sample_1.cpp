@@ -123,6 +123,21 @@ i32 main(i32 argc, char* argv[])
 		return big_chunk_tickets[gpuGetCurrSubmitIdx(gpu) % GPU_NUM_CONCURRENT_SUBMITS];
 	};
 
+	GpuRWTex tex = GPU_NULL_RWTEX;
+	{
+		const GpuRWTexDesc tex_desc = GpuRWTexDesc{
+			.name = "TestTexture",
+			.format = GPU_FORMAT_RGBA_F16,
+			.fixed_res = i32x2_init(128, 128),
+			.swapchain_relative = false
+		};
+		tex = gpuRWTexInit(gpu, &tex_desc);
+		sfz_assert(tex != GPU_NULL_RWTEX);
+	}
+	sfz_defer[=]() {
+		gpuRWTexDestroy(gpu, tex);
+	};
+
 	// Run our main loop
 	bool running = true;
 	while (running) {
@@ -185,11 +200,13 @@ i32 main(i32 argc, char* argv[])
 		struct {
 			i32x2 res;
 			GpuPtr color_ptr;
-			i32 padding;
+			GpuRWTex tex_idx;
+			u16 padding;
 			
 		} params;
 		params.res = res;
 		params.color_ptr = color_ptr;
+		params.tex_idx = tex;
 		gpuQueueDispatch(gpu, kernel, num_groups, params);
 
 		gpuSubmitQueuedWork(gpu);

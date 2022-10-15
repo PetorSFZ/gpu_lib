@@ -335,6 +335,29 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 		tex_descriptor_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 		tex_descriptor_heap_start_cpu = tex_descriptor_heap->GetCPUDescriptorHandleForHeapStart();
 		tex_descriptor_heap_start_gpu = tex_descriptor_heap->GetGPUDescriptorHandleForHeapStart();
+
+		// Set null descriptors for all potential slots in the heap
+		for (u32 i = 0; i < cfg.max_num_textures_per_type; i++) {
+			D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+			uav_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+			uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+			uav_desc.Texture2D.MipSlice = 0;
+			uav_desc.Texture2D.PlaneSlice = 0;
+
+			D3D12_CPU_DESCRIPTOR_HANDLE cpu_descriptor = {};
+			cpu_descriptor.ptr = tex_descriptor_heap_start_cpu.ptr + tex_descriptor_size * i;
+			device->CreateUnorderedAccessView(nullptr, nullptr, &uav_desc, cpu_descriptor);
+		}
+	}
+
+	// Initialize RWTex pool
+	sfz::Pool<GpuRWTexInfo> rw_textures;
+	{
+		rw_textures.init(cfg.max_num_textures_per_type, cfg.cpu_allocator, sfz_dbg("GpuLib::rw_textures"));
+		const SfzHandle null_slot = rw_textures.allocate();
+		sfz_assert(null_slot.idx() == GPU_NULL_RWTEX);
+		const SfzHandle swapchain_slot = rw_textures.allocate();
+		sfz_assert(swapchain_slot.idx() == RWTEX_SWAPCHAIN_IDX);
 	}
 
 	// Load DXC compiler
@@ -447,6 +470,8 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 	gpu->tex_descriptor_heap_start_cpu = tex_descriptor_heap_start_cpu;
 	gpu->tex_descriptor_heap_start_gpu = tex_descriptor_heap_start_gpu;
 
+	gpu->rw_textures = sfz_move(rw_textures);
+
 	gpu->dxc_utils = dxc_utils;
 	gpu->dxc_compiler = dxc_compiler;
 	gpu->dxc_include_handler = dxc_include_handler;
@@ -455,6 +480,8 @@ sfz_extern_c GpuLib* gpuLibInit(const GpuLibInitCfg* cfgIn)
 
 	gpu->swapchain_res = i32x2_splat(0);
 	gpu->swapchain = swapchain;
+
+	gpu->tmp_barriers.init(cfg.max_num_textures_per_type, cfg.cpu_allocator, sfz_dbg("GpuLib::tmp_barriers"));
 
 	// Do a quick present after initialization has finished, used to set up framebuffers
 	gpuSubmitQueuedWork(gpu);
@@ -506,6 +533,134 @@ sfz_extern_c void gpuFree(GpuLib* gpu, GpuPtr ptr)
 	(void)gpu;
 	(void)ptr;
 	// TODO: This is obviously a very bad free API, please implement real malloc/free.
+}
+
+// Textures API
+// ------------------------------------------------------------------------------------------------
+
+sfz_extern_c const char* gpuFormatToString(GpuFormat format)
+{
+	return formatToString(format);
+}
+
+sfz_extern_c GpuRWTex gpuRWTexInit(GpuLib* gpu, const GpuRWTexDesc* desc)
+{
+	if (desc->format == GPU_FORMAT_UNDEFINED) {
+		printf("[gpu_lib]: Must specify a valid texture format when creating an RWTex\n");
+		return GPU_NULL_RWTEX;
+	}
+
+	const i32x2 tex_res = calcRWTexTargetRes(gpu->swapchain_res, desc);
+
+	// Allocate texture resource
+	ComPtr<ID3D12Resource> tex;
+	{
+		D3D12_HEAP_PROPERTIES heap_props = {};
+		heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+		heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+		heap_props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+		heap_props.CreationNodeMask = 0;
+		heap_props.VisibleNodeMask = 0;
+
+		D3D12_RESOURCE_DESC res_desc = {};
+		res_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		res_desc.Alignment = 0;
+		res_desc.Width = u32(tex_res.x);
+		res_desc.Height = u32(tex_res.y);
+		res_desc.DepthOrArraySize = 1;
+		res_desc.MipLevels = 1;
+		res_desc.Format = formatToD3D12(desc->format);
+		res_desc.SampleDesc = { 1, 0 };
+		res_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+		res_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+		const bool success = CHECK_D3D12(gpu->device->CreateCommittedResource(
+			&heap_props,
+			D3D12_HEAP_FLAG_CREATE_NOT_ZEROED,
+			&res_desc,
+			D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+			nullptr,
+			IID_PPV_ARGS(&tex)));
+		if (!success) {
+			printf("[gpu_lib]: Could not allocate GpuRWTex of size %ix%i and format %s\n",
+				tex_res.x, tex_res.y, formatToString(desc->format));
+			return GPU_NULL_RWTEX;
+		}
+		setDebugName(tex.Get(), desc->name);
+	}
+
+	// Allocate slot in rwtex array
+	const SfzHandle handle = gpu->rw_textures.allocate();
+	if (handle == SFZ_NULL_HANDLE) {
+		printf("[gpu_lib]: Could not allocate slot in GpuRWTex array, out of slots.\n");
+		return GPU_NULL_RWTEX;
+	}
+
+	// Store info about texture
+	GpuRWTexInfo& info = *gpu->rw_textures.get(handle);
+	info.tex = tex;
+	info.tex_res = tex_res;
+	info.desc = *desc;
+	info.name = sfzStr96Init(desc->name);
+	info.desc.name = info.name.str; // Need to repoint name, otherwise potential use after free.
+
+	// Set descriptor in tex descriptor heap
+	const GpuRWTex tex_idx = GpuRWTex(handle.idx());
+	{
+		D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+		uav_desc.Format = formatToD3D12(desc->format);
+		uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+		uav_desc.Texture2D.MipSlice = 0;
+		uav_desc.Texture2D.PlaneSlice = 0;
+
+		D3D12_CPU_DESCRIPTOR_HANDLE cpu_descriptor = {};
+		cpu_descriptor.ptr =
+			gpu->tex_descriptor_heap_start_cpu.ptr + gpu->tex_descriptor_size * u32(tex_idx);
+		gpu->device->CreateUnorderedAccessView(tex.Get(), nullptr, &uav_desc, cpu_descriptor);
+	}
+
+	return tex_idx;
+}
+
+sfz_extern_c void gpuRWTexDestroy(GpuLib* gpu, GpuRWTex tex)
+{
+	const SfzHandle handle = gpu->rw_textures.getHandle(tex);
+	GpuRWTexInfo* tex_info = gpu->rw_textures.get(handle);
+	if (tex_info == nullptr) {
+		printf("[gpu_lib]: Trying to destroy a GpuRWTex that doesn't exist.\n");
+		return;
+	}
+
+	// Set null descriptor in tex descriptor heap
+	{
+		D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+		uav_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+		uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+		uav_desc.Texture2D.MipSlice = 0;
+		uav_desc.Texture2D.PlaneSlice = 0;
+
+		D3D12_CPU_DESCRIPTOR_HANDLE cpu_descriptor = {};
+		cpu_descriptor.ptr = gpu->tex_descriptor_heap_start_cpu.ptr + gpu->tex_descriptor_size * u32(tex);
+		gpu->device->CreateUnorderedAccessView(nullptr, nullptr, &uav_desc, cpu_descriptor);
+	}
+
+	gpu->rw_textures.deallocate(handle);
+}
+
+sfz_extern_c const GpuRWTexDesc* gpuRWTexGetDesc(const GpuLib* gpu, GpuRWTex tex)
+{
+	const SfzHandle handle = gpu->rw_textures.getHandle(tex);
+	const GpuRWTexInfo* tex_info = gpu->rw_textures.get(handle);
+	if (tex_info == nullptr) return nullptr;
+	return &tex_info->desc;
+}
+
+sfz_extern_c i32x2 gpuRWTexGetRes(const GpuLib* gpu, GpuRWTex tex)
+{
+	const SfzHandle handle = gpu->rw_textures.getHandle(tex);
+	const GpuRWTexInfo* tex_info = gpu->rw_textures.get(handle);
+	if (tex_info == nullptr) return i32x2_splat(0);
+	return tex_info->tex_res;
 }
 
 // Kernel API
@@ -766,17 +921,17 @@ sfz_extern_c i32x3 gpuKernelGetGroupDims(const GpuLib* gpu, GpuKernel kernel)
 // Command API
 // ------------------------------------------------------------------------------------------------
 
-sfz_extern_c u64 gpuGetCurrSubmitIdx(GpuLib* gpu)
+sfz_extern_c u64 gpuGetCurrSubmitIdx(const GpuLib* gpu)
 {
 	return gpu->curr_submit_idx;
 }
 
-sfz_extern_c i32x2 gpuSwapchainGetRes(GpuLib* gpu)
+sfz_extern_c i32x2 gpuSwapchainGetRes(const GpuLib* gpu)
 {
 	return gpu->swapchain_res;
 }
 
-sfz_extern_c u64 gpuTimestampGetFreq(GpuLib* gpu)
+sfz_extern_c u64 gpuTimestampGetFreq(const GpuLib* gpu)
 {
 	u64 ticks_per_sec = 0;
 	if (!CHECK_D3D12(gpu->cmd_queue->GetTimestampFrequency(&ticks_per_sec))) {
@@ -1009,7 +1164,7 @@ sfz_extern_c void gpuQueueDispatch(
 sfz_extern_c void gpuQueueGpuHeapBarrier(GpuLib* gpu)
 {
 	if (gpu->gpu_heap_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
-		printf("[gpu_lib]: Can't insert a gpu heap barrier it's in the wrong internal state\n");
+		printf("[gpu_lib]: Can't insert a gpu heap barrier, heap is in the wrong internal state.\n");
 		return;
 	}
 	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
@@ -1020,17 +1175,43 @@ sfz_extern_c void gpuQueueGpuHeapBarrier(GpuLib* gpu)
 	cmd_list_info.cmd_list->ResourceBarrier(1, &barrier);
 }
 
-sfz_extern_c void gpuQueueRWTexBarrier(GpuLib* gpu, u32 tex_idx)
+sfz_extern_c void gpuQueueRWTexBarrier(GpuLib* gpu, GpuRWTex tex_idx)
 {
-	(void)gpu;
-	(void)tex_idx;
-	// TODO: Implement
+	const SfzHandle handle = gpu->rw_textures.getHandle(tex_idx);
+	const GpuRWTexInfo* tex_info = gpu->rw_textures.get(handle);
+	if (tex_info == nullptr) {
+		printf("[gpu_lib]: Trying to insert a GpuRWTex barrier for idx %u, which doesn't exist.\n",
+			u32(tex_idx));
+		return;
+	}
+	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
+	D3D12_RESOURCE_BARRIER barrier = {};
+	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+	barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+	barrier.UAV.pResource = tex_info->tex.Get();
+	cmd_list_info.cmd_list->ResourceBarrier(1, &barrier);
 }
 
 sfz_extern_c void gpuQueueRWTexBarriers(GpuLib* gpu)
 {
-	(void)gpu;
-	// TODO: Implement
+	// Prepare barriers for all GpuRWTex
+	gpu->tmp_barriers.clear();
+	GpuRWTexInfo* tex_infos = gpu->rw_textures.data();
+	const sfz::PoolSlot* slots = gpu->rw_textures.slots();
+	const u32 array_size = gpu->rw_textures.arraySize();
+	for (u32 idx = RWTEX_SWAPCHAIN_IDX; idx < array_size; idx++) {
+		const sfz::PoolSlot slot = slots[idx];
+		if (!slot.active()) continue;
+		GpuRWTexInfo& info = tex_infos[idx];		
+		D3D12_RESOURCE_BARRIER& barrier = gpu->tmp_barriers.add();
+		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+		barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+		barrier.UAV.pResource = info.tex.Get();
+	}
+
+	// Set barriers
+	GpuCmdListInfo& cmd_list_info = gpu->getCurrCmdList();
+	cmd_list_info.cmd_list->ResourceBarrier(gpu->tmp_barriers.size(), gpu->tmp_barriers.data());
 }
 
 sfz_extern_c void gpuSubmitQueuedWork(GpuLib* gpu)
@@ -1276,7 +1457,7 @@ sfz_extern_c void gpuSwapchainPresent(GpuLib* gpu, bool vsync)
 
 			D3D12_CPU_DESCRIPTOR_HANDLE cpu_descriptor = {};
 			cpu_descriptor.ptr =
-				gpu->tex_descriptor_heap_start_cpu.ptr + gpu->tex_descriptor_size * RWTEX_ARRAY_SWAPCHAIN_RT_IDX;
+				gpu->tex_descriptor_heap_start_cpu.ptr + gpu->tex_descriptor_size * RWTEX_SWAPCHAIN_IDX;
 			gpu->device->CreateUnorderedAccessView(gpu->swapchain_rwtex.Get(), nullptr, &uav_desc, cpu_descriptor);
 		}
 	}
