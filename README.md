@@ -1,2 +1,1 @@
-# gpu_lib
-An experimental GPU API, don't expect too much I will likely get bored of it very quickly.
+# THIS LIBRARY HAS MOVED TO [`sfz_tech`](https://github.com/PetorSFZ/sfz_tech)
